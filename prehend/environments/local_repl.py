@@ -16,6 +16,7 @@ from contextlib import contextmanager
 from typing import Any
 
 from prehend.core.comms_utils import LMRequest, send_lm_request, send_lm_request_batched
+from prehend.environments import leaf_prose_guard
 from prehend.core.types import REPLResult, RLMChatCompletion
 from prehend.environments.base_env import (
     RESERVED_TOOL_NAMES,
@@ -587,6 +588,10 @@ class LocalREPL(NonIsolatedEnv):
             if hint is not None:
                 return hint
 
+        guard = leaf_prose_guard.guard_enabled()
+        if guard:
+            prompt = leaf_prose_guard.wrap_leaf_prompt(prompt)
+
         try:
             self._subcall_count += 1
             request = LMRequest(prompt=prompt, model=model, depth=self.depth, priority=priority)
@@ -596,7 +601,23 @@ class LocalREPL(NonIsolatedEnv):
                 return f"Error: {response.error}"
 
             self._pending_llm_calls.append(response.chat_completion)
-            return response.chat_completion.response
+            reply = response.chat_completion.response
+            if guard:
+                # code-shaped leaf reply (e.g. `find("V406XXA")` instead of the
+                # description): one corrective resend, keep it only if prose.
+                # The retry shares this call's budget slot - it repairs, not reads.
+                def _resend(p: str) -> str:
+                    r = send_lm_request(
+                        self.lm_handler_address,
+                        LMRequest(prompt=p, model=model, depth=self.depth, priority=priority),
+                    )
+                    if not r.success:
+                        return ""
+                    self._pending_llm_calls.append(r.chat_completion)
+                    return r.chat_completion.response
+
+                reply = leaf_prose_guard.repair_leaf_reply(reply, prompt, _resend)
+            return reply
         except Exception as e:
             return f"Error: LM query failed - {e}"
 
@@ -648,6 +669,9 @@ class LocalREPL(NonIsolatedEnv):
             # Map each sendable index to its result; oversized indices map to the
             # hint, budget-blocked indices to the budget message.
             by_index: dict[int, str] = dict(oversize_hints)
+            guard = leaf_prose_guard.guard_enabled()
+            if guard:
+                allowed = [(i, leaf_prose_guard.wrap_leaf_prompt(p)) for i, p in allowed]
             if allowed:
                 self._subcall_count += len(allowed)
                 responses = send_lm_request_batched(
@@ -663,11 +687,49 @@ class LocalREPL(NonIsolatedEnv):
                     else:
                         self._pending_llm_calls.append(response.chat_completion)
                         by_index[idx] = response.chat_completion.response
+                if guard:
+                    self._repair_batched_replies(by_index, allowed, model, priority)
             for idx, _p in sendable[len(allowed):]:
                 by_index[idx] = _SUBCALL_BUDGET_MSG
             return [by_index[i] for i in range(len(prompts))]
         except Exception as e:
             return [f"Error: LM query failed - {e}"] * len(prompts)
+
+    def _repair_batched_replies(
+        self,
+        by_index: dict[int, str],
+        allowed: list[tuple[int, str]],
+        model: str | None,
+        priority: str | int | None,
+    ) -> None:
+        """One corrective batch resend for code-shaped slots (leaf prose guard).
+
+        Retries share their original call's budget slot - they repair, not read.
+        A retry reply replaces the original only if it comes back prose."""
+        bad = [
+            (idx, p)
+            for idx, p in allowed
+            if leaf_prose_guard.looks_like_code_reply(by_index.get(idx, ""))
+        ]
+        if not bad:
+            return
+        retry_prompts = [
+            f"{leaf_prose_guard._RETRY_PREFIX}{p}" for _, p in bad
+        ]
+        retries = send_lm_request_batched(
+            self.lm_handler_address,
+            retry_prompts,
+            model=model,
+            depth=self.depth,
+            priority=priority,
+        )
+        for (idx, _p), response in zip(bad, retries, strict=False):
+            if not response.success:
+                continue
+            self._pending_llm_calls.append(response.chat_completion)
+            reply = response.chat_completion.response
+            if reply and not leaf_prose_guard.looks_like_code_reply(reply):
+                by_index[idx] = reply
 
     def _rlm_send(self, prompt: str, model: str | None = None) -> str:
         """Context-free single recursive RLM send (the engine/seam building block).
