@@ -101,3 +101,34 @@ def test_harness_defaults_thread_reject_code_shaped_answers():
     h2 = Harness(model="m", base_url="http://localhost:9999/v1",
                  runtime=Runtime(slots=4, ctx=98304))
     assert h2.srlm.reject_code_shaped_answers is False
+
+
+def test_guard_rejection_echo_bounced_then_prose_accepted():
+    # single-block assign-and-ship: the model captures a sub-call rejection hint
+    # into answer['content'] before ever seeing it (header-fix run 2026-07-08,
+    # 9/60 tasks). The shape gate must bounce rejection echoes like code.
+    from prehend.utils.subcall_guard import self_context_rejection
+    hint = self_context_rejection(["docs", "find"])
+    result, mock_lm = _run(
+        [_final(hint), _final(PROSE_ANSWER)],
+        reject_code_shaped_answers=True,
+    )
+    assert result.response == PROSE_ANSWER
+    second_prompt = str(mock_lm.completion.call_args_list[1].args[0])
+    assert "rejection" in second_prompt.lower() or "rejected" in second_prompt.lower()
+
+
+def test_strategy_verifier_echo_also_bounced():
+    from prehend.core.verifier import REJECTION_PREFIX
+    result, _ = _run(
+        [_final(REJECTION_PREFIX + "whole-task delegation."), _final(PROSE_ANSWER)],
+        reject_code_shaped_answers=True,
+    )
+    assert result.response == PROSE_ANSWER
+
+
+def test_rejection_echo_not_bounced_when_disabled():
+    from prehend.utils.subcall_guard import self_context_rejection
+    hint = self_context_rejection(["docs"])
+    result, _ = _run([_final(hint)])
+    assert result.response == hint

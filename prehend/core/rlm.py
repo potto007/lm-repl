@@ -93,6 +93,27 @@ _CODE_SHAPED_ANSWER_MSG = (
     "answer up yourself using the tools/variables in your REPL."
 )
 
+# Companion to the code-shape gate: a single-block assign-and-ship
+# (`x = llm_query(...); answer['content'] = x; answer['ready'] = True`) captures
+# a sub-call REJECTION hint into the answer before the model ever sees it
+# (header-fix run 2026-07-08: 9/60 tasks shipped the futile-delegation hint
+# verbatim). Every guard/verifier rejection contains "rejected this call", so a
+# final answer carrying it is a guard echo, never an answer.
+_REJECTION_MARKER = "rejected this call"
+
+_REJECTION_ECHO_MSG = (
+    "Your final answer contains a sub-call rejection notice, not an answer - "
+    "that sub-call was rejected and returned no data. Do NOT assign a sub-call "
+    "result to answer['content'] in the same repl block that makes the call: "
+    "print() the result first and read it. Follow the notice's guidance (use "
+    "your REPL tools/variables directly), then set answer['ready'] = True once "
+    "answer['content'] holds the actual answer."
+)
+
+
+def _is_rejection_echo(answer: str) -> bool:
+    return _REJECTION_MARKER in (answer or "")[:400]
+
 
 def _soft_budget_due(
     elapsed: float,
@@ -684,11 +705,14 @@ class RLM:
                         # enforcement) should only ever see a prose candidate.
                         if (self.reject_code_shaped_answers
                                 and self._answer_retries < self.max_answer_retries
-                                and looks_like_code_reply(final_answer)):
+                                and (looks_like_code_reply(final_answer)
+                                     or _is_rejection_echo(final_answer))):
                             self._answer_retries += 1
                             new_messages = format_iteration(iteration)
                             message_history.extend(new_messages)
-                            fb_msg = {"role": "user", "content": _CODE_SHAPED_ANSWER_MSG}
+                            fb_msg = {"role": "user", "content":
+                                      _REJECTION_ECHO_MSG if _is_rejection_echo(final_answer)
+                                      else _CODE_SHAPED_ANSWER_MSG}
                             message_history.append(fb_msg)
                             if self.compaction and hasattr(environment, "append_compaction_entry"):
                                 environment.append_compaction_entry(new_messages + [fb_msg])
