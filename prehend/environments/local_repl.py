@@ -30,7 +30,11 @@ from prehend.utils.mapreduce import (
     _compose,
     map_reduce,
 )
-from prehend.utils.subcall_guard import oversize_rejection, recommended_chunk_chars
+from prehend.utils.subcall_guard import (
+    oversize_rejection,
+    recommended_chunk_chars,
+    self_context_rejection,
+)
 
 # Drive the map-reduce seam with the query-INDEPENDENT extraction MAP (ADR-0018).
 # The legacy per-query MAP filters a chunk by the user query, so on a multihop
@@ -228,6 +232,7 @@ class LocalREPL(NonIsolatedEnv):
         max_subcalls: int | None = None,
         subcall_context_limit: int | None = None,
         model_name: str | None = None,
+        reject_self_context_delegation: bool = False,
         **kwargs,
     ):
         super().__init__(
@@ -254,6 +259,17 @@ class LocalREPL(NonIsolatedEnv):
         # exemption does NOT apply to this arithmetic input guard. None = off.
         self.subcall_context_limit = subcall_context_limit
         self.model_name = model_name
+
+        # Futile-delegation guard: when custom tools hold the task's data and a
+        # sub-call's context= is the task's own root context (the briefing), the
+        # sub-LLM - which has no REPL/tools - cannot possibly retrieve anything,
+        # so reject deterministically with a pivot-to-tools hint instead of
+        # sending (see subcall_guard.self_context_rejection). Fires only when
+        # custom_tools exist AND the context matches a loaded root context
+        # string exactly. Opt-in (default off): teacher/trajectory-generation
+        # runs must see unmodified behavior (leaf_prose_guard convention).
+        self.reject_self_context_delegation = reject_self_context_delegation
+        self._root_context_strs: list[str] = []
 
         self.max_output_chars = max_output_chars
         # Collapse a doubled empty-call '()()' -> '()' before exec. The .lower()()
@@ -415,6 +431,15 @@ class LocalREPL(NonIsolatedEnv):
         if context is None:
             return send_one(prompt)
         context = context if isinstance(context, str) else str(context)
+        # Futile-delegation guard: delegating the task's OWN briefing back out
+        # while the data lives in custom REPL tools can only echo or refuse -
+        # reject with a pivot-to-tools hint instead of paying for the send.
+        if (
+            self.reject_self_context_delegation
+            and self.custom_tools
+            and context in self._root_context_strs
+        ):
+            return self_context_rejection(list(self.custom_tools.keys()))
         # Fill model-created placeholders in BOTH the data and (via send_one /
         # run_batch, which fill the composed prompt) the instruction, before
         # chunking, so a {var} in context is substituted, not split.
@@ -840,6 +865,14 @@ class LocalREPL(NonIsolatedEnv):
         """
         if context_index is None:
             context_index = self._context_count
+
+        # Root-context fingerprint for the futile-delegation guard: match the
+        # str() coercion _dispatch_with_context applies to sub-call context=.
+        payload_str = (
+            context_payload if isinstance(context_payload, str) else str(context_payload)
+        )
+        if payload_str not in self._root_context_strs:
+            self._root_context_strs.append(payload_str)
 
         var_name = f"context_{context_index}"
 

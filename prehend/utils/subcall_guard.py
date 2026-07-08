@@ -98,3 +98,28 @@ def oversize_rejection(
         f"rlm_query_batched (smaller chunks run in parallel and are faster), then "
         f"combine the per-chunk results."
     )
+
+
+def self_context_rejection(tool_names: list[str]) -> str:
+    """
+    Actionable rejection for delegating the task's OWN root context back out via
+    a sub-call while the task's data lives in custom REPL tools.
+
+    The offloaded-corpus failure this guards (corpus-NIAH, 2026-06-27): `context`
+    holds only a short briefing describing the tools; the model's habitual
+    `llm_query(..., context=context)` hands that briefing to a sub-LLM that has
+    no REPL and no tools, so the sub-LLM can only echo tool syntax or refuse -
+    and the orchestrator ships that echo as the final answer. Pure string
+    builder; the caller decides when to fire.
+    """
+    tools = ", ".join(sorted(tool_names)) or "(none)"
+    return (
+        "Sub-call guard rejected this call: the context= you passed is this "
+        "task's own briefing (your root `context` variable), not data. Sub-LLMs "
+        "run WITHOUT your REPL and cannot see or use your tools, so delegating "
+        "the briefing cannot look anything up - the sub-LLM can only echo tool "
+        f"syntax or refuse. Use your REPL tools/data directly ({tools}) to "
+        "locate and read the relevant part yourself, then answer from what you "
+        "read. Reserve llm_query(context=...) for ACTUAL data you have already "
+        "retrieved (e.g. a document part), never for the briefing itself."
+    )

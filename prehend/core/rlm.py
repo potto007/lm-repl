@@ -18,6 +18,7 @@ from prehend.core.types import (
 )
 from prehend.core.verifier import REJECTION_PREFIX, SubcallReview, SubcallVerifier
 from prehend.environments import BaseEnv, SupportsPersistence, get_environment
+from prehend.environments.leaf_prose_guard import looks_like_code_reply
 from prehend.logger import RLMLogger, VerbosePrinter
 from prehend.utils.exceptions import (
     BudgetExceededError,
@@ -76,6 +77,20 @@ _SOFT_BUDGET_MSG = (
     "single best final answer and set answer['ready'] = True this turn. If what "
     "you have read does not actually answer the question, do not guess - say "
     "plainly that the answer was not found."
+)
+
+
+# Rejection feedback for a code-shaped final answer (reject_code_shaped_answers).
+# Observed corpus-NIAH failure (2026-06-27, rlm-trainer): a sub-LLM echoes tool
+# syntax (`find("587X5749B")`) instead of an answer, and the orchestrator ships
+# that echo verbatim via answer['content']. Shape-check the final answer and
+# bounce it back for one in-loop revision instead of terminating on it.
+_CODE_SHAPED_ANSWER_MSG = (
+    "Your final answer is code or tool syntax, not an answer. If that was a REPL "
+    "action you meant to take, run it inside a ```repl block instead. Then answer "
+    "the original question in plain prose and set answer['ready'] = True again. "
+    "If a sub-LLM gave you that text, it could not see your REPL tools - look the "
+    "answer up yourself using the tools/variables in your REPL."
 )
 
 
@@ -148,6 +163,8 @@ class RLM:
         subcall_verifier: SubcallVerifier | None = None,
         answer_verifier: Any = None,
         max_answer_retries: int = 2,
+        reject_code_shaped_answers: bool = False,
+        reject_self_context_delegation: bool = False,
         clean_retry_on_error: bool = False,
         subcall_extra_body: dict[str, Any] | None = None,
         root_max_tokens: int | None = None,
@@ -295,6 +312,20 @@ class RLM:
         # retries left) re-prompts IN-LOOP (warm prefix) instead of terminating.
         self.answer_verifier = answer_verifier
         self.max_answer_retries = max_answer_retries
+        # reject_code_shaped_answers: shape-check the final answer BEFORE the user
+        # answer_verifier; a code/tool-syntax answer (leaf_prose_guard shape rules,
+        # e.g. a `find("...")` sub-LLM echo shipped via answer['content']) is bounced
+        # back with _CODE_SHAPED_ANSWER_MSG for an in-loop revision, sharing the
+        # max_answer_retries budget. Default off: injected feedback turns would
+        # otherwise leak into teacher/trajectory-generation runs (same opt-in
+        # convention as leaf_prose_guard).
+        self.reject_code_shaped_answers = reject_code_shaped_answers
+        # reject_self_context_delegation: LocalREPL futile-delegation guard - a
+        # sub-call whose context= is this task's own root context while custom
+        # tools hold the data is rejected with a pivot-to-tools hint (see
+        # local_repl / subcall_guard.self_context_rejection). Threaded to the
+        # environment at spawn. Default off (teacher-run convention).
+        self.reject_self_context_delegation = reject_self_context_delegation
         # clean_retry_on_error: when a REPL iteration errors, DROP the failed turn
         # (broken code + its echo) from the next prompt and feed only a compact error
         # note, so the model retries fresh instead of escalating/rebuilding the broken
@@ -458,6 +489,8 @@ class RLM:
                 env_kwargs["custom_sub_tools"] = self.custom_sub_tools
             if self.compaction and self.environment_type == "local":
                 env_kwargs["compaction"] = True
+            if self.reject_self_context_delegation:
+                env_kwargs["reject_self_context_delegation"] = True
             env_kwargs["max_concurrent_subcalls"] = self.max_concurrent_subcalls
             # Arm the LocalREPL input-size guard on llm_query / llm_query_batched.
             # The REPL needs BOTH the limit and the model name (for count_tokens).
@@ -646,6 +679,21 @@ class RLM:
                     self.verbose.print_iteration(iteration, i + 1)
 
                     if final_answer is not None:
+                        # Shape gate first: a code/tool-syntax final answer is never
+                        # valid, and the user answer_verifier (e.g. citation
+                        # enforcement) should only ever see a prose candidate.
+                        if (self.reject_code_shaped_answers
+                                and self._answer_retries < self.max_answer_retries
+                                and looks_like_code_reply(final_answer)):
+                            self._answer_retries += 1
+                            new_messages = format_iteration(iteration)
+                            message_history.extend(new_messages)
+                            fb_msg = {"role": "user", "content": _CODE_SHAPED_ANSWER_MSG}
+                            message_history.append(fb_msg)
+                            if self.compaction and hasattr(environment, "append_compaction_entry"):
+                                environment.append_compaction_entry(new_messages + [fb_msg])
+                            continue
+
                         # Answer-level verification (e.g. citation enforcement). On
                         # reject with retries remaining, record the rejected attempt +
                         # feedback and CONTINUE the loop instead of terminating, so the
@@ -1232,6 +1280,10 @@ class RLM:
             # The input-size guard must follow the recursion: a child whose
             # sub-calls are unguarded re-opens the overflow surface.
             subcall_context_limit=self.subcall_context_limit,
+            # The answer/delegation shape guards must follow the recursion too:
+            # a child with tools has the same echo-and-ship failure surface.
+            reject_code_shaped_answers=self.reject_code_shaped_answers,
+            reject_self_context_delegation=self.reject_self_context_delegation,
         )
         try:
             result = child.completion(prompt, root_prompt=None)

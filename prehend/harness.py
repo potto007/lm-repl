@@ -80,6 +80,17 @@ class Defaults:
     # sub-calls are untouched via root_max_tokens (NOT max_decode_tokens), so
     # extraction-map sub-calls keep the 8192 headroom (ADR-0018). ~105s -> ~26s.
     root_max_tokens: int = 2048
+    # Corpus-NIAH failure-mode guards (2026-07-08 RCA; both default OFF so
+    # teacher/trajectory-generation harnesses see unmodified behavior - the
+    # leaf_prose_guard convention. Eval/serving callers opt in explicitly.)
+    # reject_code_shaped_answers: bounce a code/tool-syntax final answer (e.g. a
+    # sub-LLM's `find("...")` echo shipped via answer['content']) back for an
+    # in-loop revision instead of terminating on it.
+    reject_code_shaped_answers: bool = False
+    # reject_self_context_delegation: when custom tools hold the data and a
+    # sub-call's context= is the task's own briefing, reject deterministically
+    # with a pivot-to-tools hint instead of paying for a futile send.
+    reject_self_context_delegation: bool = False
 
 
 VETTED = Defaults()
@@ -312,6 +323,8 @@ class Harness:
             max_concurrent_subcalls=self.subcall_runtime.slots,
             soft_timeout_pct=d.soft_timeout_pct,
             root_max_tokens=d.root_max_tokens,
+            reject_code_shaped_answers=d.reject_code_shaped_answers,
+            reject_self_context_delegation=d.reject_self_context_delegation,
             logger=logger,
             verbose=False,
         )
