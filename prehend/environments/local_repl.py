@@ -1,6 +1,7 @@
 import copy
 import io
 import json
+import logging
 import os
 import re
 import shutil
@@ -53,6 +54,8 @@ _DOUBLED_CALL = re.compile(r"\(\)(?:\(\))+")
 # inside a PLAIN (non-f) string passed to llm_query, the data is never substituted and
 # the sub-call sees an empty placeholder. repair_unfilled_placeholders fills it in.
 _PLACEHOLDER = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
+
+log = logging.getLogger(__name__)
 
 
 class _AnswerDict(dict):
@@ -439,6 +442,15 @@ class LocalREPL(NonIsolatedEnv):
             and self.custom_tools
             and context in self._root_context_strs
         ):
+            # Log it. A rejected sub-call is never SENT, so it leaves no request in any
+            # log, and the rejection string only surfaces if the model happens to print
+            # its return value. A guard with no positive signal is indistinguishable from
+            # a guard that is dead - which is exactly how the repeat-guard went unnoticed
+            # for two days after the vLLM migration (2026-07-10).
+            log.info(
+                "sub-call guard: rejected self-context delegation (%d chars, tools: %s)",
+                len(context), ", ".join(sorted(self.custom_tools)),
+            )
             return self_context_rejection(list(self.custom_tools.keys()))
         # Fill model-created placeholders in BOTH the data and (via send_one /
         # run_batch, which fill the composed prompt) the instruction, before
