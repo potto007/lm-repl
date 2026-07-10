@@ -328,7 +328,7 @@ Full prehend suite green after each: 898 passed, 9 skipped.
 
 | ID | Date | Hypothesis | Change | Instrument | Result | Verdict |
 | --- | --- | --- | --- | --- | --- | --- |
-| EXP-008 | 2026-07-10 | Our reproduced fix for vllm#43559 (MambaManager honors `drop_eagle_block`) makes MTP+APC sound on this hybrid model, unlocking MTP's claimed +18% decode | Local patch to `.venv-vllm` MambaManager (docs/investigations/vllm-mtp-apc-43559/mamba-eagle-drop.patch) + `--speculative-config '{"method":"mtp","num_speculative_tokens":3}'` | 6 gold x 3 gate (grounding + corruption watch), fixed-prompt decode A/B (0.3-0.9% spread), spec-decode acceptance from `/metrics` | **Correctness: PASS.** No corruption - coherent grounded output, no garbage/repetition/refusal, `gold_recall` 88.9% (both misses on the ambiguous ask1, within the coin-flip band; other arms scored 78/83/100/94). Acceptance 67.2% (2.02 of 3). **Speed: net REGRESSION** - decode @56k **-5.1%** (215.9 vs 227.6), @2k **-8.9%** (229.2 vs 251.5), prefill **+17-20%** (draft model also processes the prompt). The +18% was a concurrency-1/greedy/1024-tok-prompt artifact; at 56k + temp>0 the draft forward is as memory-bound as the target's, so speculation loses. | **fix KEPT (validated, for upstream PR); MTP ROLLED BACK** - unit reverted, venv patch reverted (pristine), back on FI+W8+fp8. Not the promised win on THIS workload. |
+| EXP-008 | 2026-07-10 | Our reproduced fix for vllm#43559 (MambaManager honors `drop_eagle_block`) makes MTP+APC sound on this hybrid model, unlocking MTP's claimed +18% decode | Local patch to `.venv-vllm` MambaManager (docs/investigations/vllm-mtp-apc-43559/mamba-eagle-drop.patch) + `--speculative-config '{"method":"mtp","num_speculative_tokens":3}'` | 6 gold x 3 gate (grounding + corruption watch), fixed-prompt decode A/B (0.3-0.9% spread), spec-decode acceptance from `/metrics` | **Correctness: PASS.** No corruption - coherent grounded output, no garbage/repetition/refusal, `gold_recall` 88.9% (both misses on the ambiguous ask1, within the coin-flip band; other arms scored 78/83/100/94). Acceptance 67.2% (2.02 of 3). **Speed: net REGRESSION** - decode @56k **-5.1%** (215.9 vs 227.6), @2k **-8.9%** (229.2 vs 251.5), prefill **+17-20%** (draft model also processes the prompt). The +18% was measured on the FA2/no-fp8 stack; FlashInfer+W8+fp8 sped the target ~7% and on a 3B-active MoE the draft (sharing the big lm_head) then costs about what it skips. Confirmed by an 8k greedy num_spec 1-5 sweep (EXP-008 notes below): loss at EVERY k, best -14% at k=5. NOTE the workload is GREEDY (harness.py rlm_temperature=0.0), not temp>0 - an earlier mischaracterization; the benchmarks used temp 0 so the numbers hold, the verbal reason did not. | **fix KEPT (validated, for upstream PR); MTP ROLLED BACK** - unit reverted, venv patch reverted (pristine), back on FI+W8+fp8. Not the promised win on THIS workload. |
 | EXP-007 | 2026-07-10 | ADR-0013 unlocked `--kv-cache-dtype fp8_e4m3` (FlashInfer accepts it, FA2 structurally can't) and deferred the call; KV read is ~31% of decode bytes @56k, so halving it should be the biggest decode lever left | `--kv-cache-dtype fp8_e4m3` (local-ai `c435bb5`), on top of FlashInfer+W8 | Fixed-prompt micro A/B (<0.5% spread), in-situ APC over the gate, then 6 gold x 3 rescored against `gold_ids` | Decode **+7.5%** @56k (227.6 vs 211.6 tok/s, the biggest kernel win in the sequence), **-15% weighted** e2e; prefill @56k **+9.9%** (dequant-on-readback, ~0.4s vs decode's -5.5s). Block coarsened 1056->2096 (zeroes reuse <2096 tok) but APC held **64.2%** in situ - librarian prompts are ~56k so it doesn't bite. KV pool **+90%** but MOOT at concurrency 1 (peak usage 4-35%). Gate: `gold_recall` **94.4%** (1 miss on the ambiguous ask1, byte-identical to EXP-005's miss - draw noise, not fp8), `answer_match` **100%** (best), max latency **54.8s** (tightest tail). Caveat: **uncalibrated**, `kv_cache_scheme: None` -> scale 1.0 (`kv_cache.py:147` warns). | **kept, calibrate later** (see local-ai ADR-0015; calibrated-scales checkpoint is the queued follow-up) |
 | EXP-006 | 2026-07-10 | ADR-0011 dismissed a W8 `lm_head` as "~+3-4% decode, immaterial" under the false prefill-dominant premise; the bf16 head re-reads 1.02 GB **per decode step** (~27% of decode bytes), so under the corrected budget it should be the biggest non-upstream lever left | Serve `qwen36-35b-a3b-mtp-w8lm-w4a16-g32-ct-vllm` (local-ai `c4c072c`); no flag change | Fixed-prompt micro A/B (<0.4% spread) **checked against a memory-bandwidth model**, then 6 gold x 3 gate rescored offline against `gold_ids` (not `ground_cited`) | Decode **+6.3%** @56k, **+8.4%** @2k; prefill unchanged (the head runs once per pass, so a 56k prefill can only gain 0.01%). Predicted 211.0 tok/s from the 0.284 ms/step read saving, **measured 211.6 (+0.3%)**. **-9.1% weighted** end-to-end with FlashInfer, of which W8 is -4.93s and FlashInfer -3.32s. KV pool **+9.6%** (224,133 -> 245,760), repaying FlashInfer's 394 MiB workspace. Gate: `gold_recall` **18/18**, `gold_exact` 94.4%, citation precision 0.972, 0 uncited, 0 infra; **no grounding regression** (the apparent +22pp is a lucky draw, not a mechanism). | **kept** (see local-ai ADR-0014) |
 | EXP-005 | 2026-07-10 | ADR-0011 rejected FlashInfer on a "+46% prefill penalty"; under the corrected decode-dominant budget it should be a win | `--attention-backend FLASHINFER` (local-ai `621ccad`) | Fixed-prompt micro A/B (<0.5% spread) **weighted by the measured budget**, then a 6 gold x 3 gate for regression only | Prefill **-15%** @3.5k / **-18%** @56k, decode **+3.05%** @56k -> **-3.6% weighted**. The "+46% penalty" was **first-touch JIT** (1.515s -> 0.162s), caused by an upstream `all()`/`any()` warmup gate that skips hybrid models. Gate: **18/18 cited, 0 infra**, median 21.8 -> 19.1s, p90 85.7 -> 48.9s. KV pool -9.9%. | **kept** (see local-ai ADR-0013) |
@@ -337,6 +337,45 @@ Full prehend suite green after each: 898 passed, 9 skipped.
 | EXP-002 | 2026-07-10 | Restoring the dead repeat-guard (D5) and verifying the forced-final answer (D2) will cut the tail and the uncited answers | `a40bfa9` + `4f8dcdc` | 6 **gold** questions x 3 reps, `ground_cited` + guard-abort delta | Guard fired **4x**. Max **421.2s -> 171.5s**, mean 50.1 -> 44.6. But median flat (22.0 -> 23.2) and **p90 worse** (55.6 -> 154.3). `ground_cited` **17/18 in both**. 0 infra fails both. | **kept** (mechanism verified, tail bounded, no regression; aggregate effect within noise at n=18) |
 | EXP-001 | 2026-07-10 | Prod samples at T=1.0 because no sampling params are sent; greedy will cut the token blowup and stabilise grounding | `--override-generation-config '{"temperature":0.0,...}'` on the vLLM unit | 1 fixed question x 4 reps, `/metrics` deltas (**underpowered**: the attractor fires ~1 in 3-6) | Arm B rep1 generated **93,153** tokens (2x arm A's worst) and 500'd. The failure is verbatim repetition collapse - the classic *greedy* pathology - and `librarian/config.py:67` already documented it. | **rolled-back** |
 | EXP-000 | 2026-07-10 | Putting `{docs[id]}` first in the Map sub-call prompt lets successive sub-calls share a cached prefix | Reorder Map prompt template in `knowledge-base/librarian/ask.py` so doc text precedes the instruction | End-to-end 6-ask x 3-rep probe (**wrong instrument**) | Wash-to-worse, tail-dominated: median 22.0s -> 25.6s, mean 50.1s -> 69.8s, max 421s -> 455s, `ground_cited` 17/18 -> 16/18, plus 1 `infra_fail` traced to **D1**, not to the change. ask3/ask4 improved, ask1/ask2 got tail-hit. Prefix-cache hit rate - the quantity the hypothesis is actually about - **was never measured**. | **rolled-back** |
+
+### EXP-008 notes: the full num_spec sweep, and two corrections the user caught
+
+**The sweep.** 8k greedy prompt (real corpus doc), decode off a warm prefix, num_spec 1-5 vs the
+MTP-off baseline. Each metric from `/metrics`: acceptance overall + per-draft-position, accept-length
+(accepted per step), implied speedup (= tokens per target forward, if the draft were free), actual
+speedup (measured/baseline), and the recovery factor (actual/implied = the share of the theoretical
+gain that survives draft cost).
+
+| cfg | wall tok/s | vs base | accept % | per-position | accept-len | implied× | actual× | recovery | prefix hit% |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| off | **234.6** | - | - | - | - | - | 1.00 | - | 79 |
+| k=1 | 115.8 | -51% | 88.3 | 0.88 | 0.88 | 1.88 | 0.49 | 0.262 | 53 |
+| k=2 | 138.5 | -41% | 76.3 | 0.84/0.69 | 1.53 | 2.52 | 0.59 | 0.234 | 53 |
+| k=3 | 167.6 | -29% | 68.8 | 0.83/0.68/0.55 | 2.06 | 3.06 | 0.71 | 0.233 | 54 |
+| k=4 | 189.7 | -19% | 62.0 | 0.85/0.70/0.51/0.42 | 2.48 | 3.48 | 0.81 | 0.232 | 54 |
+| k=5 | 201.6 | -14% | 57.9 | 0.86/0.71/0.54/0.44/0.35 | 2.90 | 3.90 | 0.86 | 0.221 | 54 |
+
+Loss at every k. The draft QUALITY is fine (88% acceptance at k=1); the ECONOMICS are not: only ~22%
+of each config's theoretical speedup survives the draft cost, and the recovery factor DRIFTS DOWN as k
+rises (0.262 -> 0.221) because each added draft token costs a full forward while its acceptance decays.
+The curve asymptotes below baseline; break-even needs accept-length >= ~3.5 and the decaying
+per-position acceptance caps it near 2.9. Baseline is a cheap 3B-active MoE made cheaper by
+FlashInfer+W8+fp8, so the MTP head (sharing the 248k-row lm_head) is nearly as expensive as the token
+it skips. This is the same phenomenon the unit's old comment logged as +18% at k=3 - on the slower
+FA2/no-fp8 stack, where the draft WAS amortized.
+
+**Correction 1 (temperature).** Earlier notes called the workload "temp>0 sampling." It is GREEDY:
+`prehend/harness.py:45` sets `rlm_temperature=0.0`, ridden in `default_extra_body` on every solve
+request. The benchmarks used `temperature:0`, so the measured numbers hold; only the stated reason was
+wrong. The prompts are also not "small" - measured 5-10k tokens per request (root + sub-calls) from the
+`/metrics` prompt-size histogram.
+
+**Correction 2 (prefix cache).** An earlier table called the MTP prefix-hit drop (79% -> 53%) "a
+measurement artifact, not a real regression." That was rationalization and it was wrong: phase-isolated
+per-request measurement confirms the drop is REAL (upstream #38182, MTP erodes the align-mode hit rate).
+It is NOT the driver of the slowdown, though - decode-only (prefill excluded, vLLM's own timer) is 247
+vs 185 tok/s at k=3 (-25%), and the prefill difference is only ~2% of wall. The draft overhead is the
+cause; the cache regression rides on top.
 
 ### EXP-006 notes: the strict rescore, a scorer bug, and a smoke test that lied
 
