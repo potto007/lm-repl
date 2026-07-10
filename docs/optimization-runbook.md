@@ -56,11 +56,15 @@ measures latency and variance fine, but it cannot measure grounding.
 ## Known defects in the harness (found, not yet fixed)
 
 - **D1 - the root REPL transcript is unbounded and collides with `max_model_len`.**
-  The root call requests a fixed output budget (observed: 8192 tokens; cf.
-  `prehend/core/lm_handler.py:31` `DEFAULT_MAX_DECODE_TOKENS = 8192`) regardless of how
-  large the accumulated transcript has grown. On 2026-07-10 a 14-message root transcript
-  reached 90,113 input tokens; `90113 + 8192 = 98305 > 98304` (`max_model_len`) and vLLM
-  returned a hard 400, which the librarian surfaced as a 500 (`infra_fail`).
+  The root call requests a fixed output budget of 8192 tokens regardless of how large the
+  accumulated transcript has grown. This is **deliberately configured**, not a leaked
+  default: `knowledge-base/librarian/config.py:127` sets `root_max_tokens: int = 8192` and
+  `ask.py` passes it explicitly to `SRLM(...)`. (Sub-calls get 2048, `config.py:73`. Note
+  that is the *inverse* of what `prehend/core/lm_handler.py:23-27` claims in its comment -
+  "sub-calls ... keep the 8192 headroom". One of the two is stale; the librarian's config
+  is what runs.) On 2026-07-10 a 14-message root transcript reached 90,113 input tokens;
+  `90113 + 8192 = 98305 > 98304` (`max_model_len`) and vLLM returned a hard 400, which the
+  librarian surfaced as a 500 (`infra_fail`).
   This is **ceiling-independent**: the identical failure appears in `/tmp/kb-librarian.log`
   from the era when `max_model_len` was 65536 (`... at least 57345 input tokens`). Raising
   the ceiling from 65536 to 98304 moved the wall; it did not remove it. Fix is to clamp the
