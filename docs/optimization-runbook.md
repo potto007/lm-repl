@@ -23,12 +23,22 @@ Serving-side decisions live in local-ai `docs/decisions/` (ADR-0010, ADR-0011) a
 | --- | --- | --- | --- |
 | End-to-end ask latency (`kb_ask_eval.py`) | **heavy-tailed**: 2026-07-10 baseline over 18 rows was min 10s / median 22s / mean 50s / **max 421s** | Gross regressions (>2x on the median) | Anything under ~30%. The tail is intrinsic - a subset of asks fall into runaway REPL loops. A mean computed over 18 rows is a measurement of the tail, not of the change. |
 | `ground_cited` rate | binomial, n=3/ask is nothing | Large quality shifts | Small shifts. 12/14 vs 17/18 is not a signal. |
-| vLLM `Prefix cache hit rate` (`/metrics`, also logged per 10s) | low | **Any claim about prefix reuse** - this is the direct observable | Decode speed |
+| vLLM `vllm:prefix_cache_hits_total` / `vllm:prefix_cache_queries_total` (`/metrics`; also logged per 10s as "Prefix cache hit rate") | low | **Any claim about prefix reuse** - this is the direct observable | Decode speed |
 | Fixed prompt, `ignore_eos`, exactly 512 decoded tokens | 0.3-0.9% | Kernel / decode-path A/B | Realistic mixed load |
 | `vllm bench serve --dataset-name random` | ~10% | Realistic mixed-load throughput | Comparing kernels |
 
 The last two rows and their noise figures are established in local-ai ADR-0011 ("Two noise
 regimes"). Do not import one harness's noise floor into another.
+
+Both counters and the endpoints below were confirmed live on 2026-07-10:
+
+```bash
+# prefix reuse, cumulative since server start (68.2% at 02:20)
+curl -s http://127.0.0.1:8080/metrics | grep -E '^vllm:prefix_cache_(hits|queries)_total'
+# exact prompt token count, from the server's own tokenizer - no local tokenizer needed
+curl -s -X POST http://127.0.0.1:8080/tokenize \
+  -H 'Content-Type: application/json' -d '{"model":"qwen3.6-35b-a3b","prompt":"..."}'
+```
 
 ## Known defects in the harness (found, not yet fixed)
 
