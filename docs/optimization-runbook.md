@@ -53,6 +53,20 @@ curl -s -X POST http://127.0.0.1:8080/tokenize \
   the ceiling from 65536 to 98304 moved the wall; it did not remove it. Fix is to clamp the
   requested output budget to `max_model_len - prompt_tokens - margin`, and/or to bound
   transcript growth.
+
+  **The server's contract, MEASURED directly on 2026-07-10** by feeding exact token-id
+  prompts to `/v1/completions`: `prompt_tokens + max_tokens <= max_model_len` is accepted;
+  exactly one token over is rejected. There is no rounding and no grace.
+
+  | prompt tokens | max_tokens | sum | result |
+  | --- | --- | --- | --- |
+  | 97,000 | 1,304 | 98,304 | HTTP 200, decoded all 1,304 |
+  | 97,000 | 1,305 | 98,305 | HTTP 400 |
+
+  So the acceptance test for any D1 fix is: with a prompt near the ceiling, the harness must
+  return a short answer, never a 400. Reproduce the boundary with `/tokenize` to build an
+  exact-length prompt, then `/v1/completions` with `prompt` as the token-id array - this is
+  deterministic and takes ~15s, versus replaying an ask that only fails 1 rep in 3.
 - **D2 - runaway REPL loops correlate with uncited answers.** The pathological reps are
   slow *and* wrong: baseline `ask2` = `[56s, 26s, 421s]` with `ground_cited=[T, T, F]` -
   the 421s rep is the uncited one. Same shape post-change (455s rep, uncited). Whatever
