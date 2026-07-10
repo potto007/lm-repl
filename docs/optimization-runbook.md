@@ -23,6 +23,19 @@ Serving-side decisions live in local-ai `docs/decisions/` (ADR-0010, ADR-0011) a
 | --- | --- | --- | --- |
 | End-to-end ask latency (`kb_ask_eval.py`) | **heavy-tailed**: 2026-07-10 baseline over 18 rows was min 10s / median 22s / mean 50s / **max 421s** | Gross regressions (>2x on the median) | Anything under ~30%. The tail is intrinsic - a subset of asks fall into runaway REPL loops. A mean computed over 18 rows is a measurement of the tail, not of the change. |
 | `ground_cited` rate | binomial, n=3/ask is nothing | Large quality shifts | Small shifts. 12/14 vs 17/18 is not a signal. |
+
+**What `ground_cited` actually means**, because the lead misread it for most of 2026-07-10.
+`rlm-trainer/scripts/kb_ask_eval.py:105`:
+
+```python
+ground_cited = completed and len(claimed) > 0 and len(from_training) == 0
+```
+
+It is **not** a gold-document match. `gold_ids` are not consulted. It means: the run completed,
+the answer cited at least one id, and **none** of the cited ids were ungrounded - `from_training`
+being ids the model claimed without ever retrieving or opening them. An answer citing four
+documents, none of them the gold one, scores `True` provided all four were actually retrieved.
+It measures *"did the model invent a citation"*, not *"did the model find the right document"*.
 | vLLM `vllm:prefix_cache_hits_total` / `vllm:prefix_cache_queries_total` (`/metrics`; also logged per 10s as "Prefix cache hit rate") | low | **Any claim about prefix reuse** - this is the direct observable | Decode speed |
 | Fixed prompt, `ignore_eos`, exactly 512 decoded tokens | 0.3-0.9% | Kernel / decode-path A/B | Realistic mixed load |
 | `vllm bench serve --dataset-name random` | ~10% | Realistic mixed-load throughput | Comparing kernels |
@@ -339,20 +352,29 @@ essentially unchanged (511s baseline vs 496s). **At n=18 the aggregate latency e
 Kept because it restores a regressed safety net and removes the catastrophic tail, not because
 it demonstrably made the median ask faster. It did not.
 
-**Correction to the D2 fix's advertised scope.** The surviving uncited answer is `ask2.r2`, the
-same question that failed at baseline. It *did* cite - doc `091.1` - just not the gold doc.
-`_build_citation_verifier` (`knowledge-base/librarian/ask.py:261`) requires >=1 **grounded**
-citation (a chunk retrieved this run, or a doc opened) *or* an explicit no-coverage statement.
-`091.1` was retrieved, so the verifier passed it: **0 forced-final revise prompts fired**.
+**Correction to the D2 fix's advertised scope, and to the lead's first reading of it.** The
+surviving uncited answer is `ask2.r2`, which cited `['091.1']`. The lead initially called this
+"cited the wrong document". That was wrong: `ground_cited` never looks at `gold_ids` (see the
+instrument note above). `091.1` scored `False` because it was **claimed without having been
+retrieved** - an invented citation, `from_training`.
 
-So `4f8dcdc` makes a **citation-less** forced answer impossible. It does **not** make a
-**wrong-document** forced answer impossible, and nothing at runtime can - the gold id is not
-knowable during an ask. loop-forensics' claim that it "makes an uncited answer impossible"
-conflated the librarian's `grounded` flag with the eval's `ground_cited`, and the lead repeated
-that error before the data caught it. The forced-final answer text is also a first-person
-monologue ("The user wants the phone number... I previously found:"), i.e. the model continuing
-its own narration. `reject_code_shaped_answers` / the answer-shape guard are still **off** and
-are the natural next lever.
+More importantly, **`4f8dcdc` was not even on that code path**, which is why it logged 0
+revise prompts. There are **two** verifier bypasses, and the fix closed only one:
+
+1. `_default_answer` never called `answer_verifier` at all. **Closed by `4f8dcdc`.**
+2. **D7 (open):** the in-loop verifier at `prehend/core/rlm.py:726` is gated on
+   `self._answer_retries < self.max_answer_retries`. Once the two citation retries are spent,
+   the verifier is **not called at all** and the ungrounded answer is accepted and returned.
+   The guard silently stops guarding exactly when the model has proven it needs guarding.
+
+Fixing D7 means deciding what a run that cannot produce a grounded citation *should* return.
+Almost certainly the mandated no-coverage sentence (a scorable refusal), not an invented
+citation. That is a behaviour change with a refusal-rate cost, so it wants the user's call and
+a real gate, not a 5am patch.
+
+The forced-final answer text was also a first-person monologue ("The user wants the phone
+number... I previously found:"), i.e. the model continuing its own narration.
+`reject_code_shaped_answers` / the answer-shape guard remain **off**.
 
 ### EXP-001: greedy decoding. REJECTED, and it made things worse.
 
