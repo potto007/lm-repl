@@ -40,6 +40,19 @@ curl -s -X POST http://127.0.0.1:8080/tokenize \
   -H 'Content-Type: application/json' -d '{"model":"qwen3.6-35b-a3b","prompt":"..."}'
 ```
 
+## Discipline note: ask the gold question, verbatim
+
+On 2026-07-10 the lead ran a variance probe with the question *"Within how many calendar
+days must a Return be filed?"* The eval set's actual question is *"Within how many calendar
+days must a Return Edit be resolved"* (`gold_ids: ["007"]`, `expected_answer: "5 calendar
+days"`). The paraphrase is ambiguous against this corpus, whose relevant passage concerns
+resolving Return *Edits*. Two reps of the paraphrase cited different documents (`[007]` and
+`[140]`), and **neither could be scored**, because a citation can only be called wrong
+relative to a gold id for the question that was actually asked.
+
+Copy questions verbatim from `rlm-trainer/logs/eval_asks_*.json`. A paraphrased probe
+measures latency and variance fine, but it cannot measure grounding.
+
 ## Known defects in the harness (found, not yet fixed)
 
 - **D1 - the root REPL transcript is unbounded and collides with `max_model_len`.**
