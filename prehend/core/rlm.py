@@ -46,6 +46,7 @@ from prehend.utils.token_utils import count_tokens, get_context_limit
 # CONTINUES it - echoing the sentence verbatim before the real answer. We strip
 # that leading echo from the returned answer (see _strip_forcing_echo).
 _FORCE_FINAL_MSG = "Please provide a final answer to the user's question based on the information provided."
+_FORCE_FINAL_REVISE_MSG = "Your final answer did not pass verification; revise it."
 
 
 def _strip_forcing_echo(response: str) -> str:
@@ -1059,14 +1060,33 @@ class RLM:
         Default behavior if the RLM runs out of iterations and does not find a final answer.
         It will take the message history, and try to generate a final answer from it.
         """
+        # role="user", not "assistant". During a repetition stall the history already ends
+        # with an assistant message, so an assistant-role forcing sentence MERGES into the
+        # model's own ramble and it is asked to continue that ramble with the instruction
+        # attributed to itself (2026-07-10: a 192,065-char final assistant message).
         current_prompt = message_history + [
             {
-                "role": "assistant",
+                "role": "user",
                 "content": _FORCE_FINAL_MSG,
             }
         ]
         response = lm_handler.completion(current_prompt)
         final_answer = _strip_forcing_echo(response)
+
+        # The in-loop answer_verifier (see the iteration loop) is structurally bypassed here,
+        # which is exactly the path a runaway loop always reaches. Over 51 runs on 2026-07-10,
+        # 3 of 3 ungrounded answers arrived through this method, and 0 of the 47 runs that
+        # never reached it were ungrounded. Apply the same check, with one revision attempt.
+        # answer_verifier=None (trajectory-generation harnesses) disables this entirely.
+        if self.answer_verifier is not None:
+            ok, feedback = self.answer_verifier(final_answer)
+            if not ok:
+                current_prompt = current_prompt + [
+                    {"role": "assistant", "content": response},
+                    {"role": "user", "content": feedback or _FORCE_FINAL_REVISE_MSG},
+                ]
+                response = lm_handler.completion(current_prompt)
+                final_answer = _strip_forcing_echo(response)
 
         if self.logger:
             self.logger.log(
