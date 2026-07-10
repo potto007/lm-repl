@@ -71,6 +71,37 @@ measures latency and variance fine, but it cannot measure grounding.
   requested output budget to `max_model_len - prompt_tokens - margin`, and/or to bound
   transcript growth.
 
+  **Status: diagnosed, patch written and tested, NOT applied.** A ready diff lives at
+  `scratchpad/d1-clamp.patch` (933 passed / 8 skipped, vs 926/8 baseline; 7 new tests). Held
+  back because it adds a blocking `/tokenize` probe to every LM call (~15k calls in the log
+  window, 2-11 ms each), and because the 400 has not recurred since the repeat-guard was
+  restored (0 infra failures across EXP-002 and EXP-003). Land it deliberately, with a
+  profile, not at 5am.
+
+  Key facts for whoever lands it, all MEASURED:
+
+  - **There is no choke point before the client.** Seven call sites reach it directly. But
+    `max_tokens` enters the request body in exactly two places: `clients/openai.py:301`
+    (`completion`) and `:450` (`acompletion`). Clamping there covers root and sub-call alike.
+  - **`prompt_tokens` is not cheaply available.** `tiktoken` is deliberately bypassed for
+    `qwen` (`token_utils.py:38`) because cl100k under-counts denser tokenizers; the
+    `CONSERVATIVE_CHARS_PER_TOKEN = 2.0` fallback over-counts by ~85% (a transcript vLLM
+    tokenizes at 90,113 estimates at 166,709). Clamping on that estimate would truncate a
+    genuine 50k-token prompt to ~3.7k output tokens with 48k free.
+  - **`/tokenize` answers both questions in one call.** VERIFIED live:
+    `POST /tokenize {"model":..., "messages":[...]}` -> `{"count": 12, "max_model_len": 98304}`.
+    No hardcoded 98304, no regex on the 400 message. Nothing in `prehend/` currently reads
+    `max_model_len` from anywhere; the string `98304` appears nowhere in the package.
+  - The clamp does **not** stop transcript growth, and `prompt_tokens >= max_model_len` still
+    fails - as a typed `TokenLimitExceededError` rather than an opaque vendor 400. `ask.py`
+    only catches `TimeoutExceededError`, so it would still surface as a librarian 500.
+
+- **D6 - compaction's context limit is wrong for this model, and points past the cliff.**
+  VERIFIED: `get_context_limit("qwen3.6-35b-a3b")` returns **128,000**, because the `"qwen3"`
+  key matches as a substring. The served window is **98,304**. `rlm.py`'s compaction threshold
+  of `0.85 x limit = 108,800` therefore sits *beyond* the wall it exists to avoid, so it could
+  never fire in time even if `compaction=True` were passed - and the librarian does not pass it.
+
   **The server's contract, MEASURED directly on 2026-07-10** by feeding exact token-id
   prompts to `/v1/completions`: `prompt_tokens + max_tokens <= max_model_len` is accepted;
   exactly one token over is rejected. There is no rounding and no grace.
@@ -353,11 +384,33 @@ greedy (temp 0) repetition loop once generated 35K+ tokens server-side after its
 already timed out." The lead did not look for prior art before changing prod.
 
 **What survives.** The 5.7x wall / 5.0x token spread under T=1.0 is real, and the wiring gap
-is real: the librarian constructs `SRLM(...)` directly, never builds a `HarnessConfig`, so
-`rlm_temperature` **and `seed`** never reach the wire. Until a `seed` is sent, no A/B on this
-path is reproducible. Closing that gap is still worth doing - but it must be closed to a
-*measured* temperature, not assumed to be 0.0, and it needs >=10 reps because the repetition
-attractor fires roughly 1 rep in 3-6. n=4 cannot see it; n=2 got lucky and caught it.
+is real: the librarian constructs `SRLM(...)` directly (`ask.py:397`, the only site; `grep
+Harness librarian/` returns zero hits), so nothing ever sets sampling params and **`seed` never
+reaches the wire either**. Until a `seed` is sent, no A/B on this path is reproducible. Closing
+the gap is still worth doing - but to a *measured* temperature, not an assumed 0.0, and it
+needs >=10 reps because the repetition attractor fires roughly 1 rep in 3-6. n=4 cannot see it;
+n=2 got lucky and caught it.
+
+*(Correction: the lead repeatedly referred to `build_harness_from_config` and `HarnessConfig`.
+Neither symbol exists. The dataclass is `Defaults`, `harness.py:25`, and the code in question is
+`Harness.__init__`. The conclusion - that the librarian bypasses all of it - is unaffected.)*
+
+**The seed seam, VERIFIED by the harness-map agent with a real client + mocked `create`:** the
+route to the wire is `default_extra_body`, placed **inside `backend_kwargs`** on `ask.py`'s
+`SRLM(...)` call - not as an `SRLM` kwarg. `OpenAIClient` merges it into every request body
+(`openai.py:291`, `:442`), so it reaches root turns, socket sub-calls, child RLMs and the leaf
+fallback alike (child clients inherit via `rlm.py:1132`). `subcall_extra_body` is not the seam:
+`body = dict(self.default_extra_body)` then `body.update(extra_body)`, so a sub-call's
+`chat_template_kwargs` replaces only that key.
+
+```python
+# inside backend_kwargs of the SRLM(...) call in librarian/ask.py
+"default_extra_body": {"seed": 1234},
+```
+
+Note the ordering trap: at today's `temperature=1.0` a seed **does** control the sampler and
+buys reproducibility. Pin `temperature: 0` in the same dict and decoding goes greedy, the seed
+becomes inert - and greedy is what EXP-001 rejected. Send the seed; leave temperature alone.
 
 **Verdict: rolled back.** The server unit is restored to HEAD. Sampling is a second-order
 knob here. Fix the containment (D5) and the forced-final path (D2) first; both are
