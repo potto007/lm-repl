@@ -324,9 +324,52 @@ Full prehend suite green after each: 898 passed, 9 skipped.
 
 | ID | Date | Hypothesis | Change | Instrument | Result | Verdict |
 | --- | --- | --- | --- | --- | --- | --- |
+| EXP-003 | 2026-07-10 | The orchestrator never reads the CITATION RULE (0.24% of root requests); delivering the briefing in the system prompt will improve grounding | `cf21a21` - `custom_system_prompt = RLM_SYSTEM_PROMPT + briefing` (braces doubled) | 6 gold questions x 3 reps, vs EXP-002 (same guard + verifier), so briefing delivery is the only variable | Mean **50.1 -> 33.9s** (-32% vs baseline), p90 **154.3 -> 53.3s**, max 188.4s. `ask2` went **3/3 grounded for the first time**. But `ground_cited` **17/18, unchanged in all three arms** - the failure relocated to `ask4.r2`. Rule now reaches **all** root turns (verified: 6/6 in a smoke ask). | **kept** (latency + principle; no measurable quality win at n=18) |
 | EXP-002 | 2026-07-10 | Restoring the dead repeat-guard (D5) and verifying the forced-final answer (D2) will cut the tail and the uncited answers | `a40bfa9` + `4f8dcdc` | 6 **gold** questions x 3 reps, `ground_cited` + guard-abort delta | Guard fired **4x**. Max **421.2s -> 171.5s**, mean 50.1 -> 44.6. But median flat (22.0 -> 23.2) and **p90 worse** (55.6 -> 154.3). `ground_cited` **17/18 in both**. 0 infra fails both. | **kept** (mechanism verified, tail bounded, no regression; aggregate effect within noise at n=18) |
 | EXP-001 | 2026-07-10 | Prod samples at T=1.0 because no sampling params are sent; greedy will cut the token blowup and stabilise grounding | `--override-generation-config '{"temperature":0.0,...}'` on the vLLM unit | 1 fixed question x 4 reps, `/metrics` deltas (**underpowered**: the attractor fires ~1 in 3-6) | Arm B rep1 generated **93,153** tokens (2x arm A's worst) and 500'd. The failure is verbatim repetition collapse - the classic *greedy* pathology - and `librarian/config.py:67` already documented it. | **rolled-back** |
 | EXP-000 | 2026-07-10 | Putting `{docs[id]}` first in the Map sub-call prompt lets successive sub-calls share a cached prefix | Reorder Map prompt template in `knowledge-base/librarian/ask.py` so doc text precedes the instruction | End-to-end 6-ask x 3-rep probe (**wrong instrument**) | Wash-to-worse, tail-dominated: median 22.0s -> 25.6s, mean 50.1s -> 69.8s, max 421s -> 455s, `ground_cited` 17/18 -> 16/18, plus 1 `infra_fail` traced to **D1**, not to the change. ask3/ask4 improved, ask1/ask2 got tail-hit. Prefix-cache hit rate - the quantity the hypothesis is actually about - **was never measured**. | **rolled-back** |
+
+### EXP-003 notes: the briefing lands, latency improves, grounding does not
+
+```
+        baseline            EXP-002             EXP-003
+ask0: [ 17C  90C  12C]  [ 16C  10C   8C]  [ 31C  10C   6C]
+ask1: [ 11C  14C  49C]  [154C  18C  11C]  [ 21C  28C  29C]
+ask2: [ 56C  26C 421u]  [ 16C 170C 172u]  [188C  53C  59C]   <- first 3/3 ever
+ask3: [ 23C  10C  17C]  [ 29C   9C  10C]  [ 16C  17C  11C]
+ask4: [ 40C  35C  22C]  [ 46C  32C  28C]  [ 26C  45C  18u]   <- failure relocated here
+ask5: [ 20C  22C  20C]  [  8C  36C  33C]  [ 13C  11C  26C]
+```
+
+**Delivery is confirmed.** A smoke ask's root turns went from carrying the CITATION RULE in
+0.24% of requests to 6 of 6. The `.format()` hazard is real and handled: `prompts.py:175` formats
+the whole template, and the briefing carries four literal brace groups (`{docs[id]}` etc), so
+they are doubled at the call site.
+
+**Latency clearly improves**: mean 50.1 -> 33.9s, and p90 returns to 53.3s after EXP-002 had
+pushed it to 154.3s. Plausible mechanism: a model that has read the give-up rule and the Map
+instruction stops improvising a search strategy. Not proven - only consistent.
+
+**Grounding does not.** `ground_cited` is 17/18 in *all three* arms. `ask2`, the historical
+offender, went 3/3 grounded for the first time. Simultaneously `ask4.r2` failed. Net zero. At
+n=18 with one failure per arm, no quality claim is defensible in either direction.
+
+**What the surviving failure teaches**, and it is worth more than the aggregate: `ask4.r2`
+completed in 18s with `citations=[]`, `from_training=[]`, and this as its final answer:
+
+> "Let me read document 012 about Medicare Opioid Treatment Programs Policy Manual, which
+> mentions that no copayment is required for OTP services..."
+
+That is the model's REPL **narration** shipped as an answer. It is not a fabrication and not a
+runaway loop - it is fast, and it has no citations at all. `_build_citation_verifier` would
+reject it (`claims` empty, no no-coverage phrase). It shipped anyway, which is **D7**: the
+in-loop verifier had already spent its two retries and was therefore never called.
+
+So the two levers that remain, both already written and both switched off:
+
+1. **D7** - do not accept an answer that failed verification once retries are exhausted.
+2. **`reject_code_shaped_answers`** (`harness.py:89`, added in `08021f2` for exactly this) -
+   bounce a narration/tool-syntax answer back for revision instead of terminating on it.
 
 ### EXP-002 notes: what the fixes do and do not buy
 
