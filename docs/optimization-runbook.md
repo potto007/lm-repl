@@ -280,8 +280,48 @@ Full prehend suite green after each: 898 passed, 9 skipped.
 
 | ID | Date | Hypothesis | Change | Instrument | Result | Verdict |
 | --- | --- | --- | --- | --- | --- | --- |
+| EXP-002 | 2026-07-10 | Restoring the dead repeat-guard (D5) and verifying the forced-final answer (D2) will cut the tail and the uncited answers | `a40bfa9` + `4f8dcdc` | 6 **gold** questions x 3 reps, `ground_cited` + guard-abort delta | Guard fired **4x**. Max **421.2s -> 171.5s**, mean 50.1 -> 44.6. But median flat (22.0 -> 23.2) and **p90 worse** (55.6 -> 154.3). `ground_cited` **17/18 in both**. 0 infra fails both. | **kept** (mechanism verified, tail bounded, no regression; aggregate effect within noise at n=18) |
 | EXP-001 | 2026-07-10 | Prod samples at T=1.0 because no sampling params are sent; greedy will cut the token blowup and stabilise grounding | `--override-generation-config '{"temperature":0.0,...}'` on the vLLM unit | 1 fixed question x 4 reps, `/metrics` deltas (**underpowered**: the attractor fires ~1 in 3-6) | Arm B rep1 generated **93,153** tokens (2x arm A's worst) and 500'd. The failure is verbatim repetition collapse - the classic *greedy* pathology - and `librarian/config.py:67` already documented it. | **rolled-back** |
 | EXP-000 | 2026-07-10 | Putting `{docs[id]}` first in the Map sub-call prompt lets successive sub-calls share a cached prefix | Reorder Map prompt template in `knowledge-base/librarian/ask.py` so doc text precedes the instruction | End-to-end 6-ask x 3-rep probe (**wrong instrument**) | Wash-to-worse, tail-dominated: median 22.0s -> 25.6s, mean 50.1s -> 69.8s, max 421s -> 455s, `ground_cited` 17/18 -> 16/18, plus 1 `infra_fail` traced to **D1**, not to the change. ask3/ask4 improved, ask1/ask2 got tail-hit. Prefix-cache hit rate - the quantity the hypothesis is actually about - **was never measured**. | **rolled-back** |
+
+### EXP-002 notes: what the fixes do and do not buy
+
+Per-ask, `C` = `ground_cited`, `u` = not:
+
+```
+ask0: base [17C  90C  12C]   exp002 [ 16C  10C   8C]
+ask1: base [11C  14C  49C]   exp002 [154C  18C  11C]
+ask2: base [56C  26C 421u]   exp002 [ 16C 170C 172u]
+ask3: base [23C  10C  17C]   exp002 [ 29C   9C  10C]
+ask4: base [40C  35C  22C]   exp002 [ 46C  32C  28C]
+ask5: base [20C  22C  20C]   exp002 [  8C  36C  33C]
+```
+
+**The guard works and bounds the worst case.** 421.2s -> 171.5s, and no transcript reached the
+120k-192k chars that previously tipped requests into D1's 400. Zero infra failures.
+
+**It does not prevent stalls, it truncates them.** Aborting the stream returns partial content,
+which usually carries no ` ```repl ` fence, so the turn is still a no-op and the model can ramble
+again next turn (until `repeat_guard_abort_limit=4` forces wrap-up). Hence p90 *rose*: one
+catastrophic 421s stall became three bounded ~170s stalls. Total time spent in long runs is
+essentially unchanged (511s baseline vs 496s). **At n=18 the aggregate latency effect is noise.**
+Kept because it restores a regressed safety net and removes the catastrophic tail, not because
+it demonstrably made the median ask faster. It did not.
+
+**Correction to the D2 fix's advertised scope.** The surviving uncited answer is `ask2.r2`, the
+same question that failed at baseline. It *did* cite - doc `091.1` - just not the gold doc.
+`_build_citation_verifier` (`knowledge-base/librarian/ask.py:261`) requires >=1 **grounded**
+citation (a chunk retrieved this run, or a doc opened) *or* an explicit no-coverage statement.
+`091.1` was retrieved, so the verifier passed it: **0 forced-final revise prompts fired**.
+
+So `4f8dcdc` makes a **citation-less** forced answer impossible. It does **not** make a
+**wrong-document** forced answer impossible, and nothing at runtime can - the gold id is not
+knowable during an ask. loop-forensics' claim that it "makes an uncited answer impossible"
+conflated the librarian's `grounded` flag with the eval's `ground_cited`, and the lead repeated
+that error before the data caught it. The forced-final answer text is also a first-person
+monologue ("The user wants the phone number... I previously found:"), i.e. the model continuing
+its own narration. `reject_code_shaped_answers` / the answer-shape guard are still **off** and
+are the natural next lever.
 
 ### EXP-001: greedy decoding. REJECTED, and it made things worse.
 
