@@ -85,11 +85,66 @@ measures latency and variance fine, but it cannot measure grounding.
   the 421s rep is the uncited one. Same shape post-change (455s rep, uncited). Whatever
   makes the loop run long also makes it stop grounding. Worth attacking directly; it is
   probably the single largest quality lever in the harness.
-- **D3 - the two system prompts contradict each other on how to pass documents.**
-  Prehend's REPL system prompt says *"do NOT paste text into the `prompt` string -- just
-  pass `context=` and let it map-reduce"*. The librarian's orchestrator prompt
-  (`knowledge-base/librarian/ask.py`) says *"You MUST PASTE THE DOCUMENT TEXT INTO EACH
-  PROMPT"*. Both are live in the same request. Unresolved; see EXP-000.
+- **D3 - CORRECTED. The two prompts contradict each other but never meet.** The original
+  framing (that both are live in the same request, and one overrides the other) is **wrong**.
+  prehend's REPL prompt is the system message. The librarian's briefing is *not a message at
+  all*: it is the string passed as the REPL's `context` variable
+  (`prehend/environments/local_repl.py:880-883`), and it reaches the model only if the model
+  chooses to `print(context)` - where REPL stdout is truncated at `max_output_chars=2000`
+  (`knowledge-base/librarian/ask.py:422`). The briefing is 5,546 chars. See **P1** below,
+  which is the real defect and supersedes this one.
+
+## Prompt-delivery defects (found by the prompt-audit agent, 2026-07-10)
+
+Numbered `P*` to avoid colliding with `D*` above. P1 and P2 were independently re-verified by
+the lead against the full `/tmp/kb-librarian.log`; the rest are as reported.
+
+**P1 - the briefing is delivered to the wrong model.** MEASURED by the lead over the whole
+log, splitting requests by whether they carry a system message (root) or not (sub-call):
+
+| | root requests | sub-call requests |
+| --- | --- | --- |
+| total | 8,459 | 6,472 |
+| contain `CITATION RULE` | **20 (0.24%)** | **2,793 (43.2%)** |
+| contain `MUST PASTE THE DOCUMENT TEXT` | 64 (0.76%) | - |
+
+The citation rule reaches the orchestrator - the only model that emits citations - 0.24% of
+the time. It reaches sub-calls 43.2% of the time: tool-less leaf LLMs that cannot cite. The
+model ships it there itself by calling `llm_query(..., context=context)`, which forwards the
+entire briefing downstream (1,194 such calls; see P2).
+
+`ask.py` carries ~80 lines of post-hoc repair machinery (`scrub_unknown_markers`,
+`_CITE_FEEDBACK`, `_GROUND_FEEDBACK`, `_build_citation_verifier`, the ungrounded guard at
+`ask.py:515-543`) cleaning up fabricated citations. The rule that would prevent them has
+effectively never been shown to the model that needs it.
+
+**Fix:** deliver the briefing in the system prompt, via `custom_system_prompt` at the `SRLM(...)`
+construction (`ask.py:~397`). Note `prompts.py:175` `.format()`s the template, so the four
+brace pairs in the briefing must be escaped. This is also cache-positive: it grows the
+constant root prefix from ~3,639 to ~5,138 tokens, i.e. 3 cached blocks to 4.
+
+**P2 - `reject_self_context_delegation` exists for this exact bug and is off.**
+`prehend/utils/subcall_guard.py:103-114` names the incident it was written for
+("corpus-NIAH, 2026-06-27"). MEASURED: `"Sub-call guard rejected"` appears **0** times in the
+log. 1,194 `context=context` calls ship ~22.5k tokens of briefing+catalog into a sub-LLM that
+has no tools and cannot use it. Fix: pass `reject_self_context_delegation=True` to `SRLM(...)`.
+
+**P3 - `llm_query_batched` is misdocumented, and its `context=` path is sequential.**
+VERIFIED by the lead: `local_repl.py:518-526` accepts `context=` and `reduce=`, but
+`prompts.py:13` advertises only `llm_query_batched(prompts, model=None)` and claims it "runs
+multiple `llm_query` calls concurrently ... Much faster than sequential." When `context=` is
+passed, `local_repl.py:530-539` is a plain list comprehension - N **sequential** calls. Only
+the `context=None` path reaches `_send_batched`.
+
+**P4** - a 77,691-char catalog is duplicated into `context` *and* into the `manifest` custom
+tool (`ask.py:164-171`). **P5** - `rlm_query` is documented in the system prompt with two
+worked examples, but the librarian sets `max_depth=1`, so all 185 `rlm_query` calls silently
+degrade to `llm_query`. **P6** - unclosed ` ```repl ` fence at `prompts.py:103` renders
+"Submitting your final answer:" inside a code block. **P7** - prehend's own worked examples
+(`prompts.py:47-87`) do the very things its rules forbid (`context[:10000]`, for-loops over
+chunks, pasting); the model copies the examples, not the rules - 1,925 bare-paste blocks
+observed. **P8** - `prompts.py:68` says "when the context isn't that long (e.g. >100M
+characters)"; the inequality is backwards.
 
 ## Where the time actually goes (MEASURED 2026-07-10)
 
@@ -141,6 +196,30 @@ must be judged against:
 | ID | Date | Hypothesis | Change | Instrument | Result | Verdict |
 | --- | --- | --- | --- | --- | --- | --- |
 | EXP-000 | 2026-07-10 | Putting `{docs[id]}` first in the Map sub-call prompt lets successive sub-calls share a cached prefix | Reorder Map prompt template in `knowledge-base/librarian/ask.py` so doc text precedes the instruction | End-to-end 6-ask x 3-rep probe (**wrong instrument**) | Wash-to-worse, tail-dominated: median 22.0s -> 25.6s, mean 50.1s -> 69.8s, max 421s -> 455s, `ground_cited` 17/18 -> 16/18, plus 1 `infra_fail` traced to **D1**, not to the change. ask3/ask4 improved, ask1/ask2 got tail-hit. Prefix-cache hit rate - the quantity the hypothesis is actually about - **was never measured**. | **rolled-back** |
+
+### EXP-000: final verdict, and why it could never have worked
+
+Settled after the prompt audit. Two independent reasons, both VERIFIED:
+
+1. **The instruction it edited is not delivered.** The Map paste instruction lives in the
+   librarian briefing, which reaches the orchestrator in 64 of 8,459 root requests (0.76%).
+   Editing text the model does not read is a no-op, which is exactly the noise the probe
+   returned.
+2. **The path the model actually takes is already data-first.** The model overwhelmingly
+   calls `llm_query(..., context=...)` rather than pasting (1,997 vs 145 `llm_query_batched`
+   calls). That path composes its sub-call prompts through
+   `prehend/utils/mapreduce.py:_compose`, whose docstring records the decision: *"Data-first
+   layout (ADR-0017): the large, stable data leads and the varying instruction trails ... The
+   old instruction-first layout diverged at token 0 and re-prefilled the whole chunk every
+   query (~6.4x re-prefill measured on the multihop bench)."*
+
+So EXP-000 was re-deriving, in dead text, a decision prehend had already made and measured.
+The right change is to **delete** the paste instruction (P3/D3), not reorder it.
+
+A third reason it could never have paid, even if delivered: two *different* chunks share only
+the `"Text:\n"` header, ~2 tokens. The reuse quantum is 1056 tokens. Distinct chunks are
+distinct at token 0 by construction, so no ordering creates reuse between them. All real
+reuse comes from re-reading the *same* doc, which the data-first layout already captures.
 
 ### EXP-000 notes
 
