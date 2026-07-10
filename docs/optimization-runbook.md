@@ -22,7 +22,14 @@ Serving-side decisions live in local-ai `docs/decisions/` (ADR-0010, ADR-0011) a
 | Instrument | Spread | Resolves | Do not use for |
 | --- | --- | --- | --- |
 | End-to-end ask latency (`kb_ask_eval.py`) | **heavy-tailed**: 2026-07-10 baseline over 18 rows was min 10s / median 22s / mean 50s / **max 421s** | Gross regressions (>2x on the median) | Anything under ~30%. The tail is intrinsic - a subset of asks fall into runaway REPL loops. A mean computed over 18 rows is a measurement of the tail, not of the change. |
-| `ground_cited` rate | binomial, n=3/ask is nothing | Large quality shifts | Small shifts. 12/14 vs 17/18 is not a signal. |
+| `ground_cited` rate | binomial, n=3/ask is nothing | Whether the model **invented** a citation | Whether it cited the **right** document. It never reads `gold_ids`. See below. |
+| `gold_recall` / `gold_exact` (`rlm-trainer/scripts/score_gold_accuracy.py`) | binomial, n=3/ask | **"Did it find the right document"** - the metric of record for any grounding gate | Small shifts. 14/18 vs 18/18 is one ask's worth of draw. Runs offline over stored rows, so it costs no GPU and applies to any past artifact. |
+| vLLM `vllm:prefix_cache_hits_total` / `vllm:prefix_cache_queries_total` (`/metrics`; also logged per 10s as "Prefix cache hit rate") | low | **Any claim about prefix reuse** - this is the direct observable | Decode speed |
+| Fixed prompt, `ignore_eos`, exactly 512 decoded tokens | 0.3-0.9% | Kernel / decode-path A/B | Realistic mixed load |
+| `vllm bench serve --dataset-name random` | ~10% | Realistic mixed-load throughput | Comparing kernels |
+
+The last two rows and their noise figures are established in local-ai ADR-0011 ("Two noise
+regimes"). Do not import one harness's noise floor into another.
 
 **What `ground_cited` actually means**, because the lead misread it for most of 2026-07-10.
 `rlm-trainer/scripts/kb_ask_eval.py:105`:
@@ -36,12 +43,9 @@ the answer cited at least one id, and **none** of the cited ids were ungrounded 
 being ids the model claimed without ever retrieving or opening them. An answer citing four
 documents, none of them the gold one, scores `True` provided all four were actually retrieved.
 It measures *"did the model invent a citation"*, not *"did the model find the right document"*.
-| vLLM `vllm:prefix_cache_hits_total` / `vllm:prefix_cache_queries_total` (`/metrics`; also logged per 10s as "Prefix cache hit rate") | low | **Any claim about prefix reuse** - this is the direct observable | Decode speed |
-| Fixed prompt, `ignore_eos`, exactly 512 decoded tokens | 0.3-0.9% | Kernel / decode-path A/B | Realistic mixed load |
-| `vllm bench serve --dataset-name random` | ~10% | Realistic mixed-load throughput | Comparing kernels |
 
-The last two rows and their noise figures are established in local-ai ADR-0011 ("Two noise
-regimes"). Do not import one harness's noise floor into another.
+**Every `N/18 cited` figure in the ledger below is `ground_cited`**, and therefore answers the
+weaker question. The strict rescore (EXP-006 notes) is the one to cite for grounding.
 
 Both counters and the endpoints below were confirmed live on 2026-07-10:
 
@@ -324,12 +328,57 @@ Full prehend suite green after each: 898 passed, 9 skipped.
 
 | ID | Date | Hypothesis | Change | Instrument | Result | Verdict |
 | --- | --- | --- | --- | --- | --- | --- |
+| EXP-006 | 2026-07-10 | ADR-0011 dismissed a W8 `lm_head` as "~+3-4% decode, immaterial" under the false prefill-dominant premise; the bf16 head re-reads 1.02 GB **per decode step** (~27% of decode bytes), so under the corrected budget it should be the biggest non-upstream lever left | Serve `qwen36-35b-a3b-mtp-w8lm-w4a16-g32-ct-vllm` (local-ai `c4c072c`); no flag change | Fixed-prompt micro A/B (<0.4% spread) **checked against a memory-bandwidth model**, then 6 gold x 3 gate rescored offline against `gold_ids` (not `ground_cited`) | Decode **+6.3%** @56k, **+8.4%** @2k; prefill unchanged (the head runs once per pass, so a 56k prefill can only gain 0.01%). Predicted 211.0 tok/s from the 0.284 ms/step read saving, **measured 211.6 (+0.3%)**. **-9.1% weighted** end-to-end with FlashInfer, of which W8 is -4.93s and FlashInfer -3.32s. KV pool **+9.6%** (224,133 -> 245,760), repaying FlashInfer's 394 MiB workspace. Gate: `gold_recall` **18/18**, `gold_exact` 94.4%, citation precision 0.972, 0 uncited, 0 infra; **no grounding regression** (the apparent +22pp is a lucky draw, not a mechanism). | **kept** (see local-ai ADR-0014) |
 | EXP-005 | 2026-07-10 | ADR-0011 rejected FlashInfer on a "+46% prefill penalty"; under the corrected decode-dominant budget it should be a win | `--attention-backend FLASHINFER` (local-ai `621ccad`) | Fixed-prompt micro A/B (<0.5% spread) **weighted by the measured budget**, then a 6 gold x 3 gate for regression only | Prefill **-15%** @3.5k / **-18%** @56k, decode **+3.05%** @56k -> **-3.6% weighted**. The "+46% penalty" was **first-touch JIT** (1.515s -> 0.162s), caused by an upstream `all()`/`any()` warmup gate that skips hybrid models. Gate: **18/18 cited, 0 infra**, median 21.8 -> 19.1s, p90 85.7 -> 48.9s. KV pool -9.9%. | **kept** (see local-ai ADR-0013) |
 | EXP-004 | 2026-07-10 | `llm_query(context=context)` hands the briefing to a tool-less sub-LLM which can only echo tool syntax; the guard prehend wrote for this will stop the echo reaching the user | `8d6ae45` - `reject_self_context_delegation=True`; `63918bb` - log when it fires | 6 gold questions x 3 reps vs EXP-003 (guard is the only variable) | **18/18 cited** (first clean sweep), **max 112.6s** (lowest of any arm), median 21.8s. Guard fired **10x**. Post-guard, **0 of 54 sub-calls** carry the briefing (36.7% under P1 alone). BUT `ask1` regressed on all 3 reps: `[21,28,29]` -> `[58,86,59]`; mean 33.9 -> 39.1s, p90 53.3 -> 85.7s. | **kept, flagged** (correctness + worst case; a real per-question latency regression) |
 | EXP-003 | 2026-07-10 | The orchestrator never reads the CITATION RULE (0.24% of root requests); delivering the briefing in the system prompt will improve grounding | `cf21a21` - `custom_system_prompt = RLM_SYSTEM_PROMPT + briefing` (braces doubled) | 6 gold questions x 3 reps, vs EXP-002 (same guard + verifier), so briefing delivery is the only variable | Mean **50.1 -> 33.9s** (-32% vs baseline), p90 **154.3 -> 53.3s**, max 188.4s. `ask2` went **3/3 grounded for the first time**. But `ground_cited` **17/18, unchanged in all three arms** - the failure relocated to `ask4.r2`. Rule now reaches **all** root turns (verified: 6/6 in a smoke ask). | **kept** (latency + principle; no measurable quality win at n=18) |
 | EXP-002 | 2026-07-10 | Restoring the dead repeat-guard (D5) and verifying the forced-final answer (D2) will cut the tail and the uncited answers | `a40bfa9` + `4f8dcdc` | 6 **gold** questions x 3 reps, `ground_cited` + guard-abort delta | Guard fired **4x**. Max **421.2s -> 171.5s**, mean 50.1 -> 44.6. But median flat (22.0 -> 23.2) and **p90 worse** (55.6 -> 154.3). `ground_cited` **17/18 in both**. 0 infra fails both. | **kept** (mechanism verified, tail bounded, no regression; aggregate effect within noise at n=18) |
 | EXP-001 | 2026-07-10 | Prod samples at T=1.0 because no sampling params are sent; greedy will cut the token blowup and stabilise grounding | `--override-generation-config '{"temperature":0.0,...}'` on the vLLM unit | 1 fixed question x 4 reps, `/metrics` deltas (**underpowered**: the attractor fires ~1 in 3-6) | Arm B rep1 generated **93,153** tokens (2x arm A's worst) and 500'd. The failure is verbatim repetition collapse - the classic *greedy* pathology - and `librarian/config.py:67` already documented it. | **rolled-back** |
 | EXP-000 | 2026-07-10 | Putting `{docs[id]}` first in the Map sub-call prompt lets successive sub-calls share a cached prefix | Reorder Map prompt template in `knowledge-base/librarian/ask.py` so doc text precedes the instruction | End-to-end 6-ask x 3-rep probe (**wrong instrument**) | Wash-to-worse, tail-dominated: median 22.0s -> 25.6s, mean 50.1s -> 69.8s, max 421s -> 455s, `ground_cited` 17/18 -> 16/18, plus 1 `infra_fail` traced to **D1**, not to the change. ask3/ask4 improved, ask1/ask2 got tail-hit. Prefix-cache hit rate - the quantity the hypothesis is actually about - **was never measured**. | **rolled-back** |
+
+### EXP-006 notes: the strict rescore, a scorer bug, and a smoke test that lied
+
+**All four stored arms, rescored against `gold_ids`.** The ledger's `N/18 cited` column is
+`ground_cited`, which cannot see a wrong-document citation. Rerunning
+`rlm-trainer/scripts/score_gold_accuracy.py` over the stored rows (no GPU, no re-ask) gives the
+grounding picture the gate was actually supposed to produce:
+
+| | baseline | EXP-004 FA2+bf16 | EXP-005 FI+bf16 | EXP-006 FI+W8 |
+| --- | --- | --- | --- | --- |
+| `ground_cited` (the weak metric) | 17/18 | 18/18 | 18/18 | 18/18 |
+| `gold_recall` (right doc cited) | 88.9% | 83.3% | 77.8% | **100.0%** |
+| `gold_exact` (no padding) | 88.9% | 72.2% | 61.1% | **94.4%** |
+| citation precision | 0.941 | 0.750 | 0.671 | **0.972** |
+| `answer_match` | 94.4% | 88.9% | 88.9% | **94.4%** |
+
+Three arms tie at 18/18 on `ground_cited` while spanning 77.8-100% on `gold_recall`. That gap is
+the whole reason the strict scorer exists.
+
+**Do not read EXP-006's sweep as a quality win.** A lower-precision head improving retrieval has no
+mechanism. The harness samples at T>0; quantizing the head perturbs the logits, changing the sampled
+trajectory, changing whether a run falls into the wandering attractor. Evidence that this column is
+draw-dominated: baseline and EXP-004 differ only by a harness guard that cannot affect which document
+is retrieved, yet their `gold_recall` differs by one row. At n=18 with a heavy tail, read the table as
+**"no regression"** and nothing more.
+
+**A scorer bug found while building that table** (fixed: rlm-trainer `80c38ae`, with regression
+tests). `answer_matches` mapped number-words to digits on the *expected* side only, so the literally
+correct answer `"Nine services [002.1]"` reduced to `{"0021"}` against a gold `{"9"}` and scored as a
+miss - silently, on every arm, for as long as the scorer had existed. It also tokenized inline
+citations, letting a doc id's digits satisfy a gold token. The `answer_match` row above is post-fix;
+any figure quoted before that commit is understated. The lesson is the same one this runbook keeps
+relearning: **an instrument with no self-check is indistinguishable from a working one.**
+
+**The smoke test that nearly vetoed a correct change.** W8 is a precision reduction on the layer that
+emits every citation token, so it was gated on grounding rather than tok/s. A single ad-hoc probe -
+*"How many units can be billed for a total treatment time of 50 minutes?"* - **refused** under W8
+(157.5s, `grounded=False`, no citations) where FlashInfer+bf16 had answered it citing `[021]`. That is
+exactly the failure a degraded head would produce. It does not reproduce: three further draws returned
+a refusal, `"1 unit"` citing `[021]`, and `"3 units"` citing `[010]`. **The question is
+underspecified** - it names a total treatment time with no component breakdown, unlike gold ask 5,
+which supplies one - so three draws produced three behaviours. It is not in the gold set. See
+"Discipline note: ask the gold question, verbatim", above; this is that note firing in reverse, and it
+came within one decision of rejecting a -9.1% end-to-end win.
 
 ### EXP-004 notes: the self-delegation guard, and a second dead guard found
 
