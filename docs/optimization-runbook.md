@@ -104,11 +104,22 @@ must be judged against:
 2. **local-ai ADR-0011's first Decision Driver is wrong.** It states "Fresh prefill of long
    prompts, not decode throughput, dominates ask latency here." Measured end-to-end, prefill
    is 3-5% and decode is 94-97%. The ADR's *decisions* mostly survive (they were argued on
-   microbenchmarks), but its FlashInfer rejection rests on the false premise and must be
-   re-derived: FlashInfer decodes +4.9% and prefills +46%; weighted by the real budget that
-   is roughly `-4.6%` decode against `+2.5%` prefill, i.e. a net ~2% **win**, not a loss.
-   ADRs are immutable - this needs a superseding ADR, not an edit. Do not act on it without
-   re-measuring; ~2% is near the end-to-end noise floor.
+   microbenchmarks that are still valid measurements of what they measured), but its
+   **FlashInfer rejection rests on the false premise** and must be re-derived. Applying the
+   ADR's own per-kernel figures (FA2 decode 175.9 tok/s, fresh 56k prefill 4.26s; FlashInfer
+   184.5 tok/s, 6.24s) to ask A's real budget:
+
+   - prefill: `4.95s x (6.24/4.26) = 7.25s`, i.e. **+2.30s**
+   - decode: `85.91s x (175.9/184.5) = 81.91s`, i.e. **-4.00s**
+   - net: **-1.70s on 90.86s = -1.9%**, a *win* for FlashInfer, opposite in sign to ADR-0011.
+
+   This is an extrapolation, not a measurement, and it is fragile in one specific way: it
+   assumes FlashInfer's +46% prefill penalty scales proportionally. It was measured on a
+   single fresh 56k prompt, whereas ask A prefills across 23 requests at 66.8% cache hit,
+   so its fresh chunks are ~3.5k tokens each. The penalty at 3.5k is unmeasured and could
+   be larger or smaller in relative terms. **Do not act on this without an end-to-end A/B**,
+   and note that 1.9% sits near the end-to-end noise floor, so the A/B needs the fixed-prompt
+   harness or many reps. ADRs are immutable: this needs a superseding ADR, not an edit.
 3. The biggest lever available is **generating fewer tokens**, and after that, decoding them
    faster (MTP gave +18% output tok/s at concurrency 1, currently blocked on vllm#47861).
 
