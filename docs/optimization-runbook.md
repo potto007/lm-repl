@@ -121,12 +121,40 @@ measures latency and variance fine, but it cannot measure grounding.
   stderr; a turn with **zero** code blocks takes the `else` branch and **resets the counter**,
   so `max_errors` can never fire on a stall.
 
-- **D5 - the repeat-guard cannot see these rambles.** `prehend/clients/openai.py:380` reads
-  `if self._repeat_guard_threshold and not parts:` - VERIFIED by the lead. The guard only runs
-  when there is no `content`, i.e. on `reasoning_content` only. These rambles arrive as
-  `content`, so `parts` is non-empty from the first token and the guard never engages.
-  MEASURED: 103 `repeat-guard: aborting` lines exist in the log; **0** in the probe window.
-  The machinery is written, tuned, and validated - it is simply pointed at the wrong stream.
+- **D5 - FIXED. The repeat-guard was silently killed by the migration to vLLM.**
+  `prehend/clients/openai.py:380` read `if self._repeat_guard_threshold and not parts:`. The
+  guard therefore only ran while the stream carried `reasoning_content` and no `content`.
+
+  The librarian enables it (`.env.librarian`: `KB_REPEAT_GUARD_THRESHOLD=0.35`,
+  `KB_REPEAT_GUARD_ABORT_LIMIT=4`), and it used to work. MEASURED, dates of the 103
+  `repeat-guard: aborting` lines in `/tmp/kb-librarian.log`:
+
+  | date | aborts |
+  | --- | --- |
+  | 2026-07-05 | 12 |
+  | 2026-07-06 | 20 |
+  | 2026-07-07 | 3 |
+  | 2026-07-08 | **68** |
+  | 2026-07-09, 07-10 (vLLM era) | **0** |
+
+  The vLLM server runs with `reasoning_parser=''` (confirmed in `/tmp/vllm-server.log`), so it
+  never emits `reasoning_content` - MEASURED: the string appears **0** times in the entire
+  librarian log. `parts` is non-empty from the first token, `not parts` is never true, and the
+  guard has been dead since the migration. It was firing 68 times on 2026-07-08 alone.
+
+  **This is why the rambles run unchecked now and did not the week before.** The previous
+  server (llama.cpp `--jinja`) routed thought tokens to `reasoning_content`; vLLM without a
+  reasoning parser routes everything to `content`. Nothing about the model or the prompts
+  changed - the guard's input stream did.
+
+  Fixed in `a40bfa9`: the guard now watches whichever stream the generation is producing, and
+  judges `content` only past `_REPEAT_GUARD_CONTENT_MIN_CHARS = 4000` (the largest healthy root
+  turn observed was 2,575 chars). Four regression tests in `tests/test_repeat_guard_content.py`,
+  including one asserting the original reasoning-only behaviour still works.
+
+  **Lesson for the ledger:** a guard with no positive signal is indistinguishable from a guard
+  that is working. This one went dark for two days and nothing alerted. Any future guard should
+  emit a heartbeat, or a metric, or something that goes to zero loudly.
 - **D3 - CORRECTED. The two prompts contradict each other but never meet.** The original
   framing (that both are live in the same request, and one overrides the other) is **wrong**.
   prehend's REPL prompt is the system message. The librarian's briefing is *not a message at
@@ -232,6 +260,21 @@ must be judged against:
    harness or many reps. ADRs are immutable: this needs a superseding ADR, not an edit.
 3. The biggest lever available is **generating fewer tokens**, and after that, decoding them
    faster (MTP gave +18% output tok/s at concurrency 1, currently blocked on vllm#47861).
+
+## Changes applied (pending EXP-002 measurement)
+
+Both are sampling-independent, both re-verified against the code, both committed separately so
+either can be reverted alone. `root_max_tokens 8192 -> 2048` was **considered and skipped**:
+`librarian/config.py:127`'s own comment records that "real final answers run 2-4K tokens",
+so capping at 2048 would truncate healthy answers to buy an effect the repeat-guard already
+delivers without that cost.
+
+| commit | change | file |
+| --- | --- | --- |
+| `a40bfa9` | repeat-guard watches `content`, not only `reasoning_content` (D5) | `prehend/clients/openai.py` |
+| `4f8dcdc` | `_default_answer` runs `answer_verifier` with one revision, and its forcing sentence is `role: "user"` (D2) | `prehend/core/rlm.py` |
+
+Full prehend suite green after each: 898 passed, 9 skipped.
 
 ## Ledger
 
