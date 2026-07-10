@@ -1,0 +1,156 @@
+diff --git i/prehend/clients/openai.py w/prehend/clients/openai.py
+index 60b3699..c19a8ae 100644
+--- i/prehend/clients/openai.py
++++ w/prehend/clients/openai.py
+@@ -1,3 +1,4 @@
++import asyncio
+ import logging
+ import os
+ import threading
+@@ -12,10 +13,22 @@ from dotenv import load_dotenv
+ from prehend.clients.base_lm import BaseLM
+ from prehend.clients.scheduler import Priority, RequestScheduler, resolve_priority
+ from prehend.core.types import ModelUsageSummary, UsageSummary
+-from prehend.utils.exceptions import CancellationError, TimeoutExceededError
++from prehend.utils.exceptions import (
++    CancellationError,
++    TimeoutExceededError,
++    TokenLimitExceededError,
++)
++from prehend.utils.token_utils import server_token_budget
+ 
+ log = logging.getLogger(__name__)
+ 
++# Headroom between the tokenized prompt and the served window. The server contract is
++# exact (prompt_tokens + max_tokens <= max_model_len, no grace), and /tokenize is asked
++# with the SAME merged messages the request sends, so this only covers template skew:
++# chat_template_kwargs (e.g. enable_thinking) ride in the request body but not in the
++# /tokenize probe, and can shift the rendered prompt by a few tokens.
++CONTEXT_MARGIN_TOKENS = 64
++
+ load_dotenv()
+ 
+ # Load API keys from environment variables
+@@ -268,6 +281,37 @@ class OpenAIClient(BaseLM):
+                 message=f"LM call aborted at run deadline ({self._max_timeout:.1f}s)",
+             )
+ 
++    def _apply_window_clamp(
++        self, budget: tuple[int, int] | None, create_kwargs: dict[str, Any]
++    ) -> None:
++        """Shrink max_tokens so prompt+output fits the served context window.
++
++        The server contract is exact: prompt_tokens + max_tokens <= max_model_len, no
++        grace (97,000+1,304 -> HTTP 200; 97,000+1,305 -> HTTP 400). Callers pick a FIXED
++        budget (root 8192, sub-call 2048) with no view of how long the prompt has grown,
++        so a long root transcript eventually overflows and vLLM hard-400s the whole run.
++        Spend only what is left. budget=None (any server that does not report a window)
++        leaves create_kwargs untouched, so the llama-server path stays byte-identical.
++        """
++        if budget is None:
++            return
++        prompt_tokens, window = budget
++        room = window - prompt_tokens - CONTEXT_MARGIN_TOKENS
++        if room <= 0:
++            # The prompt alone fills the window - no max_tokens can make this fit.
++            # A typed error naming both numbers beats an opaque vendor 400.
++            raise TokenLimitExceededError(
++                tokens_used=prompt_tokens,
++                token_limit=window,
++                message=(
++                    f"Prompt ({prompt_tokens:,} tokens) leaves no room to answer "
++                    f"within the {window:,}-token served window"
++                ),
++            )
++        cap = create_kwargs.get("max_tokens")
++        if cap is not None:
++            create_kwargs["max_tokens"] = min(cap, room)
++
+     def completion(
+         self,
+         prompt: str | list[dict[str, Any]],
+@@ -300,6 +344,10 @@ class OpenAIClient(BaseLM):
+         if max_tokens is not None:
+             create_kwargs["max_tokens"] = max_tokens
+ 
++        self._apply_window_clamp(
++            server_token_budget(self.base_url, model, messages), create_kwargs
++        )
++
+         p = resolve_priority(priority)
+         return self._do_completion(model, messages, body, create_kwargs, p)
+ 
+@@ -449,6 +497,13 @@ class OpenAIClient(BaseLM):
+         if max_tokens is not None:
+             create_kwargs["max_tokens"] = max_tokens
+ 
++        # to_thread: server_token_budget is a blocking urllib call, and acompletion runs
++        # on the handler's shared loop where batched sub-calls fan out concurrently.
++        self._apply_window_clamp(
++            await asyncio.to_thread(server_token_budget, self.base_url, model, messages),
++            create_kwargs,
++        )
++
+         p = resolve_priority(priority)
+         return await self._ado_completion(model, messages, body, create_kwargs, p)
+ 
+diff --git i/prehend/utils/token_utils.py w/prehend/utils/token_utils.py
+index 5076add..fd5e46f 100644
+--- i/prehend/utils/token_utils.py
++++ w/prehend/utils/token_utils.py
+@@ -5,7 +5,9 @@ Uses tiktoken for OpenAI-style models when available; otherwise estimates
+ with ~4 characters per token.
+ """
+ 
++import json
+ import math
++import urllib.request
+ from typing import Any
+ 
+ # Default context limit when model is unknown (tokens)
+@@ -230,3 +232,45 @@ def per_call_subcall_budget(pool: int | None, slots: int) -> int | None:
+         return None
+     slots = max(1, slots)
+     return max(1, pool // slots)
++
++
++def server_token_budget(
++    base_url: str | None,
++    model: str,
++    messages: list[dict[str, Any]],
++    *,
++    timeout: float = 5.0,
++) -> tuple[int, int] | None:
++    """Ask the SERVER for ``(prompt_tokens, max_model_len)`` via ``/tokenize``.
++
++    ``count_tokens`` is the wrong instrument here: it deliberately OVER-counts
++    non-OpenAI models (CONSERVATIVE_CHARS_PER_TOKEN), which is the safe bias for a
++    reject-or-chunk guard but not for sizing an output budget - a transcript vLLM
++    tokenizes at 90,113 estimates at ~166,709, so a budget derived from it would
++    truncate answers that fit fine. vLLM's ``/tokenize`` returns the exact prompt
++    length under the served chat template AND the exact serving window in one
++    structured response.
++
++    Returns ``None`` - "no clamp, keep prior behavior" - for any server that does not
++    answer with both fields (llama-server's ``/tokenize`` returns only ``tokens``) and
++    for any transport error. Never raises.
++    """
++    # A non-str base_url (None on the default OpenAI client; a Mock in tests) means
++    # "no server to ask" - never let it reach urllib and break the never-raises promise.
++    if not isinstance(base_url, str) or not base_url:
++        return None
++    root = base_url.rstrip("/")
++    if root.endswith("/v1"):
++        root = root[: -len("/v1")]
++    payload = json.dumps(
++        {"model": model, "messages": messages, "add_generation_prompt": True}
++    ).encode()
++    request = urllib.request.Request(
++        f"{root}/tokenize", data=payload, headers={"Content-Type": "application/json"}
++    )
++    try:
++        with urllib.request.urlopen(request, timeout=timeout) as r:
++            body = json.loads(r.read())
++        return int(body["count"]), int(body["max_model_len"])
++    except Exception:
++        return None
