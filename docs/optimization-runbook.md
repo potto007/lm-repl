@@ -78,6 +78,40 @@ curl -s -X POST http://127.0.0.1:8080/tokenize \
   (`knowledge-base/librarian/ask.py`) says *"You MUST PASTE THE DOCUMENT TEXT INTO EACH
   PROMPT"*. Both are live in the same request. Unresolved; see EXP-000.
 
+## Where the time actually goes (MEASURED 2026-07-10)
+
+Per-ask `/metrics` deltas against the live server. This is the budget every optimization
+must be judged against:
+
+| | ask A (91.6s wall) | ask B (198.5s wall) |
+| --- | --- | --- |
+| vLLM requests issued | 23 | 44 |
+| prompt tokens | 240,340 | - |
+| **generated tokens** | **18,188** | **55,654** |
+| prefix cache hit rate | 66.8% | 83.2% |
+| server prefill time | 4.95s (**5.4%**) | 11.26s (**3.3%**) |
+| server decode time | 85.91s (**94.4%**) | 327.98s (**96.7%**) |
+| host-side orchestration | 0.61s (0.7%) | - |
+
+(Summed request time exceeds wall on ask B because sub-calls run concurrently,
+`max_concurrent_subcalls=4`. The prefill:decode *ratio* is what matters and it is stable.)
+
+**Decode dominates. Token generation volume is the cost.** Three consequences:
+
+1. Prefill-side serving flags attack ~5% of the budget. `--max-num-batched-tokens 8192` cut
+   fresh prefill by 30%, which is at most ~1.6% end-to-end. That is why the tuned probe in
+   EXP-000 showed no end-to-end win, and it is the correct, expected result - not a defect.
+2. **local-ai ADR-0011's first Decision Driver is wrong.** It states "Fresh prefill of long
+   prompts, not decode throughput, dominates ask latency here." Measured end-to-end, prefill
+   is 3-5% and decode is 94-97%. The ADR's *decisions* mostly survive (they were argued on
+   microbenchmarks), but its FlashInfer rejection rests on the false premise and must be
+   re-derived: FlashInfer decodes +4.9% and prefills +46%; weighted by the real budget that
+   is roughly `-4.6%` decode against `+2.5%` prefill, i.e. a net ~2% **win**, not a loss.
+   ADRs are immutable - this needs a superseding ADR, not an edit. Do not act on it without
+   re-measuring; ~2% is near the end-to-end noise floor.
+3. The biggest lever available is **generating fewer tokens**, and after that, decoding them
+   faster (MTP gave +18% output tok/s at concurrency 1, currently blocked on vllm#47861).
+
 ## Ledger
 
 | ID | Date | Hypothesis | Change | Instrument | Result | Verdict |
