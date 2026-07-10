@@ -85,6 +85,10 @@ _REPEAT_GUARD_K = 4                 # word n-gram size
 _REPEAT_GUARD_WINDOW_CHARS = 1500   # trailing reasoning examined
 _REPEAT_GUARD_MIN_WORDS = 60        # don't judge until this much reasoning has accrued
 _REPEAT_GUARD_CHECK_EVERY = 300     # chars of new reasoning between (cheap) re-checks
+# Content is guarded too (see the stream loop), but only past this floor. A legit root
+# turn peaked at 2,575 chars over the 2026-07-10 sample; degenerate turns reached
+# 120k-192k. 4,000 leaves ~55% headroom over the largest healthy turn observed.
+_REPEAT_GUARD_CONTENT_MIN_CHARS = 4000
 
 
 def _reasoning_is_looping(
@@ -360,6 +364,7 @@ class OpenAIClient(BaseLM):
         reasoning_parts: list[str] = []
         usage = None
         reasoning_chars_at_check = 0
+        content_chars_at_check = 0
         try:
             for chunk in stream:
                 self._check_abort()
@@ -372,20 +377,36 @@ class OpenAIClient(BaseLM):
                         reasoning_parts.append(reasoning)
                 if getattr(chunk, "usage", None) is not None:
                     usage = chunk.usage
-                # Repeat-guard: only while still reasoning-only (no answer content yet),
-                # re-checked every _REPEAT_GUARD_CHECK_EVERY chars of new reasoning so the
-                # scan stays cheap. On a no-progress loop, stop early and let the finally
-                # close the stream (server frees the slot) - _resolve_content then returns
-                # the tagged tail, the same output the spin would reach far later.
-                if self._repeat_guard_threshold and not parts:
-                    total = sum(len(r) for r in reasoning_parts)
-                    if total - reasoning_chars_at_check >= _REPEAT_GUARD_CHECK_EVERY:
-                        reasoning_chars_at_check = total
+                # Repeat-guard, re-checked every _REPEAT_GUARD_CHECK_EVERY chars of new
+                # text so the scan stays cheap. On a no-progress loop, stop early and let
+                # the finally close the stream (server frees the slot) - _resolve_content
+                # then returns the tagged tail, the same output the spin would reach far later.
+                #
+                # It guards whichever stream this generation is producing. It used to guard
+                # `reasoning_parts` only, behind `not parts`, which made it dead on the
+                # orchestrator: that path runs with thinking OFF, so content arrives from the
+                # first token and the guard never engaged. The prod failure is a CONTENT
+                # ramble - a root turn emitting no ```repl fence and repeating one line up to
+                # 343x, growing the merged assistant message to 192k chars (2026-07-10).
+                # Content is only judged past _REPEAT_GUARD_CONTENT_MIN_CHARS so a healthy
+                # turn can never trip it.
+                if self._repeat_guard_threshold:
+                    on_content = bool(parts)
+                    watched = parts if on_content else reasoning_parts
+                    at_check = content_chars_at_check if on_content else reasoning_chars_at_check
+                    floor = _REPEAT_GUARD_CONTENT_MIN_CHARS if on_content else 0
+                    total = sum(len(r) for r in watched)
+                    if total >= floor and total - at_check >= _REPEAT_GUARD_CHECK_EVERY:
+                        if on_content:
+                            content_chars_at_check = total
+                        else:
+                            reasoning_chars_at_check = total
                         if _reasoning_is_looping(
-                            "".join(reasoning_parts), self._repeat_guard_threshold
+                            "".join(watched), self._repeat_guard_threshold
                         ):
                             log.info(
-                                "repeat-guard: aborting looping reasoning at %d chars", total
+                                "repeat-guard: aborting looping %s at %d chars",
+                                "content" if on_content else "reasoning", total,
                             )
                             self.repeat_guard_aborts += 1
                             break
