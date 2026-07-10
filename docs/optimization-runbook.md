@@ -84,11 +84,49 @@ measures latency and variance fine, but it cannot measure grounding.
   return a short answer, never a 400. Reproduce the boundary with `/tokenize` to build an
   exact-length prompt, then `/v1/completions` with `prompt` as the token-id array - this is
   deterministic and takes ~15s, versus replaying an ask that only fails 1 rep in 3.
-- **D2 - runaway REPL loops correlate with uncited answers.** The pathological reps are
-  slow *and* wrong: baseline `ask2` = `[56s, 26s, 421s]` with `ground_cited=[T, T, F]` -
-  the 421s rep is the uncited one. Same shape post-change (455s rep, uncited). Whatever
-  makes the loop run long also makes it stop grounding. Worth attacking directly; it is
-  probably the single largest quality lever in the harness.
+- **D2 - SOLVED (diagnosis). It is a verbatim repetition collapse, not exploration, and
+  the uncited answer has a separate deterministic cause.** Established by the loop-forensics
+  agent from the transcripts, with the key code sites re-verified by the lead.
+
+  *The stall.* A root turn emits **zero executable code blocks** and instead rambles,
+  repeating itself verbatim. Distinct-8gram ratio of the trailing assistant message collapses
+  from 1.000 to 0.319-0.490 on slow runs, versus 0.924-0.936 on fast ones. One line appeared
+  **343 times verbatim**. Because `prehend/utils/parsing.py:15` matches only ` ```repl `
+  fences, a turn whose code sits in a ` ```python ` fence executes nothing - and
+  `format_iteration` emits one user message *per code block*, so zero code blocks means zero
+  user messages, the history keeps ending on `assistant`, and the next turn **merges into the
+  same message**, growing it in place to 120k-192k chars. That growth is what eventually
+  trips D1's 400.
+
+  *This is not "more exploration."* The 421s run made **2** sub-calls; the fast controls made
+  **4**. Slow runs explore *less*. Root generation dominates: ~57,321 root tokens on the 421s
+  run against ~2,199 on a 16.4s control, a **26x** ratio, in a handful of enormous turns that
+  each run to the 8192 cap.
+
+  *The uncited answer.* `librarian/config.py:56` sets `max_iterations: int = 20`. On
+  exhaustion `prehend/core/rlm.py:808` calls `_default_answer`, which appends a forcing
+  sentence, generates once, and returns - **without ever calling `answer_verifier`**. The
+  in-loop citation guard (`rlm.py:726-738`) is structurally bypassed on precisely the path a
+  runaway loop leads to. Cross-tab over 51 completed runs: of 3 ungrounded answers, **3 of 3**
+  came through `_default_answer`; of the 47 runs that never reached it, **0** were ungrounded.
+  A 375.0s run that recovered before iteration 20 returned grounded with three citations.
+
+  **So "slow implies uncited" is false. "Exhausting the iteration budget implies uncited" is
+  true, and it is deterministic.**
+
+  Two aggravators: `_default_answer` (`rlm.py:1057`) appends its forcing sentence with
+  `role: "assistant"`, so during a stall it merges into the model's own ramble and the model
+  is asked to continue its ramble with the instruction attributed to itself. And
+  `_check_iteration_limits` only increments `_consecutive_errors` when a code block wrote to
+  stderr; a turn with **zero** code blocks takes the `else` branch and **resets the counter**,
+  so `max_errors` can never fire on a stall.
+
+- **D5 - the repeat-guard cannot see these rambles.** `prehend/clients/openai.py:380` reads
+  `if self._repeat_guard_threshold and not parts:` - VERIFIED by the lead. The guard only runs
+  when there is no `content`, i.e. on `reasoning_content` only. These rambles arrive as
+  `content`, so `parts` is non-empty from the first token and the guard never engages.
+  MEASURED: 103 `repeat-guard: aborting` lines exist in the log; **0** in the probe window.
+  The machinery is written, tuned, and validated - it is simply pointed at the wrong stream.
 - **D3 - CORRECTED. The two prompts contradict each other but never meet.** The original
   framing (that both are live in the same request, and one overrides the other) is **wrong**.
   prehend's REPL prompt is the system message. The librarian's briefing is *not a message at
@@ -199,7 +237,48 @@ must be judged against:
 
 | ID | Date | Hypothesis | Change | Instrument | Result | Verdict |
 | --- | --- | --- | --- | --- | --- | --- |
+| EXP-001 | 2026-07-10 | Prod samples at T=1.0 because no sampling params are sent; greedy will cut the token blowup and stabilise grounding | `--override-generation-config '{"temperature":0.0,...}'` on the vLLM unit | 1 fixed question x 4 reps, `/metrics` deltas (**underpowered**: the attractor fires ~1 in 3-6) | Arm B rep1 generated **93,153** tokens (2x arm A's worst) and 500'd. The failure is verbatim repetition collapse - the classic *greedy* pathology - and `librarian/config.py:67` already documented it. | **rolled-back** |
 | EXP-000 | 2026-07-10 | Putting `{docs[id]}` first in the Map sub-call prompt lets successive sub-calls share a cached prefix | Reorder Map prompt template in `knowledge-base/librarian/ask.py` so doc text precedes the instruction | End-to-end 6-ask x 3-rep probe (**wrong instrument**) | Wash-to-worse, tail-dominated: median 22.0s -> 25.6s, mean 50.1s -> 69.8s, max 421s -> 455s, `ground_cited` 17/18 -> 16/18, plus 1 `infra_fail` traced to **D1**, not to the change. ask3/ask4 improved, ask1/ask2 got tail-hit. Prefix-cache hit rate - the quantity the hypothesis is actually about - **was never measured**. | **rolled-back** |
+
+### EXP-001: greedy decoding. REJECTED, and it made things worse.
+
+**Hypothesis (the lead's):** prod sends no sampling params, so vLLM applies the checkpoint's
+`generation_config.json` (`temperature=1.0, top_k=20, top_p=0.95`). prehend's own default is
+`rlm_temperature=0.0` (`harness.py:45`). High-entropy sampling in a code-writing REPL was
+assumed to cause the wandering, the token blowup, and the uncited answers.
+
+**Method:** one fixed question, 4 reps per arm, `/metrics` deltas per ask. Arm A = prod
+(T=1.0). Arm B = server-wide greedy via `--override-generation-config
+'{"temperature":0.0,"top_k":-1,"top_p":1.0}'` on the vLLM unit (a zero-code, reversible
+experiment; under `temperature=0` vLLM takes argmax, so the `top_k`/`top_p` values are no-ops).
+
+| arm | wall min / med / max | gen tokens min / med / max | outcome |
+| --- | --- | --- | --- |
+| A - T=1.0, prod | 38.8 / 145.0 / 221.2 s (**5.7x**) | 9,007 / 29,747 / 45,132 (**5.0x**) | 4/4 grounded |
+| B - greedy | 35.9 s, then **484.7 s** | 6,788, then **93,153** | rep0 cited `[007]`; rep1 **HTTP 500** |
+
+**Result: falsified, and dangerously so.** Arm B rep0 looked great. Arm B rep1 produced the
+worst collapse of the entire night - 93,153 generated tokens, more than **double** arm A's
+worst rep - and drove the transcript past `max_model_len` into D1's 400. Arm B was stopped
+after 2 reps and the override reverted.
+
+**Why the hypothesis was wrong.** D2's collapse is *verbatim repetition*, which is the
+classic pathology of **greedy** decoding, not of high-entropy sampling. Temperature 1.0 would
+predict divergent, non-repeating text; the transcripts show one line emitted 343 times. The
+evidence was already in this repo: `knowledge-base/librarian/config.py:67` records that "a
+greedy (temp 0) repetition loop once generated 35K+ tokens server-side after its ask had
+already timed out." The lead did not look for prior art before changing prod.
+
+**What survives.** The 5.7x wall / 5.0x token spread under T=1.0 is real, and the wiring gap
+is real: the librarian constructs `SRLM(...)` directly, never builds a `HarnessConfig`, so
+`rlm_temperature` **and `seed`** never reach the wire. Until a `seed` is sent, no A/B on this
+path is reproducible. Closing that gap is still worth doing - but it must be closed to a
+*measured* temperature, not assumed to be 0.0, and it needs >=10 reps because the repetition
+attractor fires roughly 1 rep in 3-6. n=4 cannot see it; n=2 got lucky and caught it.
+
+**Verdict: rolled back.** The server unit is restored to HEAD. Sampling is a second-order
+knob here. Fix the containment (D5) and the forced-final path (D2) first; both are
+sampling-independent.
 
 ### EXP-000: final verdict, and why it could never have worked
 
