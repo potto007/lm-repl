@@ -324,10 +324,50 @@ Full prehend suite green after each: 898 passed, 9 skipped.
 
 | ID | Date | Hypothesis | Change | Instrument | Result | Verdict |
 | --- | --- | --- | --- | --- | --- | --- |
+| EXP-004 | 2026-07-10 | `llm_query(context=context)` hands the briefing to a tool-less sub-LLM which can only echo tool syntax; the guard prehend wrote for this will stop the echo reaching the user | `8d6ae45` - `reject_self_context_delegation=True`; `63918bb` - log when it fires | 6 gold questions x 3 reps vs EXP-003 (guard is the only variable) | **18/18 cited** (first clean sweep), **max 112.6s** (lowest of any arm), median 21.8s. Guard fired **10x**. Post-guard, **0 of 54 sub-calls** carry the briefing (36.7% under P1 alone). BUT `ask1` regressed on all 3 reps: `[21,28,29]` -> `[58,86,59]`; mean 33.9 -> 39.1s, p90 53.3 -> 85.7s. | **kept, flagged** (correctness + worst case; a real per-question latency regression) |
 | EXP-003 | 2026-07-10 | The orchestrator never reads the CITATION RULE (0.24% of root requests); delivering the briefing in the system prompt will improve grounding | `cf21a21` - `custom_system_prompt = RLM_SYSTEM_PROMPT + briefing` (braces doubled) | 6 gold questions x 3 reps, vs EXP-002 (same guard + verifier), so briefing delivery is the only variable | Mean **50.1 -> 33.9s** (-32% vs baseline), p90 **154.3 -> 53.3s**, max 188.4s. `ask2` went **3/3 grounded for the first time**. But `ground_cited` **17/18, unchanged in all three arms** - the failure relocated to `ask4.r2`. Rule now reaches **all** root turns (verified: 6/6 in a smoke ask). | **kept** (latency + principle; no measurable quality win at n=18) |
 | EXP-002 | 2026-07-10 | Restoring the dead repeat-guard (D5) and verifying the forced-final answer (D2) will cut the tail and the uncited answers | `a40bfa9` + `4f8dcdc` | 6 **gold** questions x 3 reps, `ground_cited` + guard-abort delta | Guard fired **4x**. Max **421.2s -> 171.5s**, mean 50.1 -> 44.6. But median flat (22.0 -> 23.2) and **p90 worse** (55.6 -> 154.3). `ground_cited` **17/18 in both**. 0 infra fails both. | **kept** (mechanism verified, tail bounded, no regression; aggregate effect within noise at n=18) |
 | EXP-001 | 2026-07-10 | Prod samples at T=1.0 because no sampling params are sent; greedy will cut the token blowup and stabilise grounding | `--override-generation-config '{"temperature":0.0,...}'` on the vLLM unit | 1 fixed question x 4 reps, `/metrics` deltas (**underpowered**: the attractor fires ~1 in 3-6) | Arm B rep1 generated **93,153** tokens (2x arm A's worst) and 500'd. The failure is verbatim repetition collapse - the classic *greedy* pathology - and `librarian/config.py:67` already documented it. | **rolled-back** |
 | EXP-000 | 2026-07-10 | Putting `{docs[id]}` first in the Map sub-call prompt lets successive sub-calls share a cached prefix | Reorder Map prompt template in `knowledge-base/librarian/ask.py` so doc text precedes the instruction | End-to-end 6-ask x 3-rep probe (**wrong instrument**) | Wash-to-worse, tail-dominated: median 22.0s -> 25.6s, mean 50.1s -> 69.8s, max 421s -> 455s, `ground_cited` 17/18 -> 16/18, plus 1 `infra_fail` traced to **D1**, not to the change. ask3/ask4 improved, ask1/ask2 got tail-hit. Prefix-cache hit rate - the quantity the hypothesis is actually about - **was never measured**. | **rolled-back** |
+
+### EXP-004 notes: the self-delegation guard, and a second dead guard found
+
+```
+        baseline            EXP-002             EXP-003             EXP-004
+ask0: [ 17C  90C  12C]  [ 16C  10C   8C]  [ 31C  10C   6C]  [ 21C  17C  21C]
+ask1: [ 11C  14C  49C]  [154C  18C  11C]  [ 21C  28C  29C]  [ 58C  86C  59C]  <- REGRESSED, 3/3 reps
+ask2: [ 56C  26C 421u]  [ 16C 170C 172u]  [188C  53C  59C]  [113C  50C  48C]
+ask3: [ 23C  10C  17C]  [ 29C   9C  10C]  [ 16C  17C  11C]  [ 19C   9C  10C]
+ask4: [ 40C  35C  22C]  [ 46C  32C  28C]  [ 26C  45C  18u]  [ 14C  96C  22C]  <- narration answer gone
+ask5: [ 20C  22C  20C]  [  8C  36C  33C]  [ 13C  11C  26C]  [ 11C  39C  10C]
+```
+
+`subcall_guard.self_context_rejection`'s own docstring predicted the exact failure EXP-003
+surfaced: *"hands that briefing to a sub-LLM that has no REPL and no tools, so the sub-LLM can
+only echo tool syntax or refuse - and the orchestrator ships that echo as the final answer."*
+EXP-003's `ask4.r2` was that echo, verbatim ("Let me read document 012 about...", 0 citations).
+The guard was written for this incident (corpus-NIAH, 2026-06-27) and had never been enabled.
+
+**Effect, MEASURED.** It fired 10 times. Sub-calls carrying the briefing went from 36.7% (P1
+alone) to **0 of 54**. `ground_cited` reached 18/18 and the worst-case ask fell to 112.6s.
+
+**Cost, MEASURED and not noise.** `ask1` regressed on all three reps, roughly 2-3x. A rejected
+sub-call costs a REPL iteration and forces a re-plan, so mean and p90 moved the wrong way
+(33.9 -> 39.1s, 53.3 -> 85.7s) even as median and max improved.
+
+**Honest scoring.** 18/18 vs 17/18 is one discordant row at n=18. That is a directionally
+correct result with a mechanism behind it, **not** a significant quality win. A 50-ask gate is
+needed before anyone claims the citation-repair machinery in `ask.py` can be retired.
+
+**And a second dead guard, found the same way as the first.** `local_repl.py` *returns* the
+rejection string rather than sending the sub-call, and logged **nothing**. The string only
+reaches a transcript if the model prints its return value. So the guard's activity was invisible:
+the lead first measured 0 firings and nearly concluded it was inert, when in fact it had already
+suppressed every self-delegation. Fixed in `63918bb` - it now emits an INFO line when it fires.
+
+This is the same lesson as D5, twice in one night: **a guard with no positive signal cannot be
+distinguished from a guard that is dead.** Every guard in this codebase should log, or export a
+counter, when it acts.
 
 ### EXP-003 notes: the briefing lands, latency improves, grounding does not
 
