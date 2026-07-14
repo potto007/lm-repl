@@ -1,5 +1,6 @@
 import logging
 import os
+import re
 import threading
 import time
 from collections import defaultdict
@@ -24,6 +25,44 @@ DEFAULT_OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 DEFAULT_VERCEL_API_KEY = os.getenv("AI_GATEWAY_API_KEY")
 DEFAULT_PRIME_API_KEY = os.getenv("PRIME_API_KEY")
 DEFAULT_PRIME_INTELLECT_BASE_URL = "https://api.pinference.ai/api/v1/"
+
+
+# vLLM admission check: it rejects a request when prompt + max_tokens exceeds
+# max-model-len, and the 400 body states all three numbers (vllm/renderers/params.py).
+# So the output budget that WOULD have fit is arithmetic, not an estimate -- no
+# tokenizer and no per-model context table needed on our side, both of which would
+# be a guess (count_tokens deliberately OVER-counts for qwen, which is the safe
+# direction for a reject guard but would cripple a clamp).
+#
+# NOTE this is NOT _is_context_contention: that is llama-server's KV-pressure
+# failure, where the request would fit if it had the pool to itself and a retry at
+# higher priority is the fix. This one can never fit as sent, so a bare retry loops.
+_CTX_OVERFLOW_RE = re.compile(
+    r"maximum context length is (\d+) tokens\..*?"
+    r"you requested (\d+) output tokens.*?"
+    r"prompt contains (?:at least )?(\d+) input tokens",
+    re.S,
+)
+
+# Held back from the clamped budget: the server re-tokenizes on the retry (chat
+# template, tokenizer skew), so the prompt count it just reported is not guaranteed
+# to reproduce exactly.
+_CTX_CLAMP_MARGIN = 256
+
+# Below this, a retry is not worth the round trip -- the model has no room to say
+# anything useful, and the caller should see the overflow rather than a stub answer.
+_CTX_MIN_OUTPUT = 256
+
+
+def _ctx_overflow_budget(e: openai.APIStatusError) -> int | None:
+    """Output budget that fits, per the server's own numbers. None if not a context
+    overflow, or if the prompt alone leaves no useful room (unrecoverable here)."""
+    m = _CTX_OVERFLOW_RE.search(str(e))
+    if m is None:
+        return None
+    ctx_len, _requested, prompt_tokens = (int(g) for g in m.groups())
+    room = ctx_len - prompt_tokens - _CTX_CLAMP_MARGIN
+    return room if room >= _CTX_MIN_OUTPUT else None
 
 
 def _is_context_contention(e: openai.APIStatusError) -> bool:
@@ -332,6 +371,17 @@ class OpenAIClient(BaseLM):
                     message.content, getattr(message, "reasoning_content", None)
                 )
             except (openai.BadRequestError, openai.InternalServerError) as e:
+                budget = _ctx_overflow_budget(e)
+                if budget is not None and budget < create_kwargs.get("max_tokens", budget + 1):
+                    # Terminates: max_tokens strictly decreases each pass and is floored
+                    # at _CTX_MIN_OUTPUT, below which _ctx_overflow_budget returns None.
+                    log.info(
+                        "context overflow, clamping max_tokens %s -> %d",
+                        create_kwargs.get("max_tokens"),
+                        budget,
+                    )
+                    create_kwargs["max_tokens"] = budget
+                    continue
                 if (
                     self.scheduler
                     and priority != Priority.CONTENTION_RETRY
@@ -479,6 +529,15 @@ class OpenAIClient(BaseLM):
                     message.content, getattr(message, "reasoning_content", None)
                 )
             except (openai.BadRequestError, openai.InternalServerError) as e:
+                budget = _ctx_overflow_budget(e)
+                if budget is not None and budget < create_kwargs.get("max_tokens", budget + 1):
+                    log.info(
+                        "context overflow, clamping max_tokens %s -> %d",
+                        create_kwargs.get("max_tokens"),
+                        budget,
+                    )
+                    create_kwargs["max_tokens"] = budget
+                    continue
                 if (
                     self.scheduler
                     and priority != Priority.CONTENTION_RETRY

@@ -9,7 +9,11 @@ import httpx
 import openai as openai_sdk
 import pytest
 
-from prehend.clients.openai import OpenAIClient, _is_context_contention
+from prehend.clients.openai import (
+    OpenAIClient,
+    _ctx_overflow_budget,
+    _is_context_contention,
+)
 from prehend.clients.scheduler import Priority, RequestScheduler, resolve_priority
 from prehend.core.comms_utils import LMRequest
 from prehend.core.lm_handler import LMHandler
@@ -1085,3 +1089,69 @@ def test_rlm_stores_coordination_dir(tmp_path):
         scheduler_coordination_dir=tmp_path,
     )
     assert rlm.scheduler_coordination_dir == tmp_path
+
+
+# =============================================================================
+# vLLM context-overflow clamp
+# =============================================================================
+
+
+def _ctx_overflow_error(ctx=81920, output=8192, prompt=74153) -> openai_sdk.BadRequestError:
+    """vLLM's admission rejection, verbatim from vllm/renderers/params.py. The live
+    shape behind the librarian's 500s (2026-07-14): the root RLM transcript grew to
+    ~74k tokens and the 8192-token output reservation pushed it past max-model-len."""
+    request = httpx.Request("POST", "http://localhost:8080/v1/chat/completions")
+    response = httpx.Response(400, request=request)
+    message = (
+        f"This model's maximum context length is {ctx} tokens. However, you "
+        f"requested {output} output tokens and your prompt contains {prompt} "
+        f"input tokens, for a total of {prompt + output} tokens. Please reduce "
+        f"the length of the input prompt or the number of requested output tokens."
+    )
+    body = {"error": {"code": 400, "message": message, "type": "BadRequestError"}}
+    return openai_sdk.BadRequestError(message, response=response, body=body)
+
+
+def test_ctx_overflow_budget_is_the_servers_own_arithmetic():
+    # 81920 ctx - 74153 prompt - 256 margin
+    assert _ctx_overflow_budget(_ctx_overflow_error()) == 7511
+
+
+def test_ctx_overflow_budget_ignores_llama_server_contention():
+    # llama-server's KV-pressure errors are a DIFFERENT failure with a different
+    # fix (retry at p1). Clamping them would silently shrink a request that would
+    # have fit given the pool to itself.
+    assert _ctx_overflow_budget(_contention_error()) is None
+    assert _ctx_overflow_budget(_pool_exhaustion_error()) is None
+    assert _ctx_overflow_budget(_other_400_error()) is None
+
+
+def test_ctx_overflow_budget_none_when_prompt_leaves_no_room():
+    # Prompt alone all but fills the window: no useful answer fits, so the caller
+    # should see the overflow rather than get a stub back.
+    assert _ctx_overflow_budget(_ctx_overflow_error(prompt=81900)) is None
+
+
+def test_completion_clamps_max_tokens_on_ctx_overflow():
+    client = _make_client()  # no scheduler: the clamp is arithmetic, not contention
+    client.client.chat.completions.create = MagicMock(
+        side_effect=[_ctx_overflow_error(), _ok_response()]
+    )
+
+    assert client.completion("hello", max_tokens=8192) == "ok"
+    assert client.client.chat.completions.create.call_count == 2
+    retry_kwargs = client.client.chat.completions.create.call_args_list[1].kwargs
+    assert retry_kwargs["max_tokens"] == 7511
+
+
+def test_completion_ctx_overflow_terminates_and_propagates():
+    # A server that keeps reporting the same overflow must not spin: the clamp only
+    # retries while it strictly LOWERS max_tokens, so the second 400 propagates.
+    client = _make_client()
+    client.client.chat.completions.create = MagicMock(
+        side_effect=[_ctx_overflow_error(), _ctx_overflow_error(output=7511)]
+    )
+
+    with pytest.raises(openai_sdk.BadRequestError):
+        client.completion("hello", max_tokens=8192)
+    assert client.client.chat.completions.create.call_count == 2
