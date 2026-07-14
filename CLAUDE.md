@@ -2,6 +2,8 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+Machine-wide rules (the shared GPU, prod vLLM server, systemd units, monitoring rail, git/code conventions) live in ~/.claude/CLAUDE.md and are loaded in every session. This file holds only what is specific to prehend.
+
 ## What this is
 
 prehend (originally lm-repl; import path `prehend`, repo `potto007/prehend`, on-disk dir `~/src/prehend`) is a language-model harness that learns. Context is offloaded into a variable inside a REPL environment, and the model writes programs that slice, search, and recursively query that context instead of attending over it directly; an experience-memory layer (`prehend/memory/`) distills and retrieves past solves so each run improves on the last. See ADR-0007 for the rename to prehend and ADR-0005 for the memory layer.
@@ -9,30 +11,6 @@ prehend (originally lm-repl; import path `prehend`, repo `potto007/prehend`, on-
 This venv uses `uv` (there is NO `pip` binary in `.venv/bin`; use `~/.local/bin/uv`).
 
 **CRITICAL**: This instruction file must not be modified without gaining explicit user permission first. You may edit any other files in the project, including README.md, but this file must remain unchanged unless user grants permission.
-
-**IMPORTANT**: NEVER use the "em dash". If a dash is appropriate for a situation, use the regular dash.
-
-## Status updates
-Only state facts that tool output confirmed in this session. Do not infer file properties (for example: ignored, tracked, permissions), build outcomes, or side effects you did not directly observe.
-
-## CRITICAL: inference server logging (local-ai promtail -> Loki -> Grafana)
-
-The monitoring rail in **local-ai** runs promtail, which tails a FIXED set of files and ships them to Loki for the Grafana "logs" panels and the `SglangInferenceLogsStale` alert. An inference server whose output goes anywhere else is invisible to the dashboard. This is the recurring "no logs on the dash" failure.
-
-**MANDATORY**: whenever you start an inference server ad-hoc, OR write any ad-hoc / benchmark / test / one-off script that starts an inference server as one of its steps (e.g. spinning up the inference server the harness drives), that server's stdout AND stderr MUST land in the canonical log for its type:
-
-| Inference server | Canonical log (promtail tails this) |
-| --- | --- |
-| SGLang (`python -m sglang.launch_server ...`) | `/tmp/sglang-server.log` |
-| llama.cpp (`llama-server` / dual-context server) | `/tmp/llama-server.log` |
-
-Satisfy it ONE of these ways:
-- Preferred: launch via `~/src/local-ai/scripts/sglang-launch.sh ARGS...`, a drop-in for `python -m sglang.launch_server ARGS...` that tees stdout+stderr to `/tmp/sglang-server.log` no matter what else you redirect.
-- Or tee/append yourself: `<launch> 2>&1 | tee -a /tmp/sglang-server.log` (or `>> /tmp/sglang-server.log 2>&1`).
-
-**MUST NOT** point an inference server's output at ONLY a private, per-run, or scratchpad file (e.g. `> /tmp/sglang-bench.log`, `> .../scratchpad/run.log`). promtail does not tail those, so the logs panel goes dark and the stale-logs alert fires. A per-run file is fine ONLY in addition to the canonical log (the wrapper tees to both).
-
-Source of truth lives in local-ai: `monitoring/promtail/promtail.yml` (tailed paths), `scripts/sglang-launch.sh` (the wrapper).
 
 ## llama-server (the harness's served Gnosis model): diagnosing endpoint timeouts
 
@@ -49,36 +27,6 @@ Real server/client notes:
 - **Orphans:** SIGTERM won't kill a python client blocked in an httpx timeout; before launch `ps -eo cmd | grep '[.]venv/bin/python'` must be empty (SIGKILL + confirm; beware grep self-match).
 
 Ops: kill the server by explicit PID (NEVER `pkill -f llama-server` - self-match, exit 144); confirm port 8080 has 0 listeners + VRAM back to idle (~2GB) before relaunch; relaunch needs `LD_LIBRARY_PATH=/usr/local/cuda-13/lib64`. Validate config changes with a SUSTAINED run, not a burst.
-
-## 🚨 CRITICAL: CONCURRENT EXECUTION & FILE MANAGEMENT
-
-**ABSOLUTE RULES**:
-1. **NEVER save working files, text/mds and tests to the root folder**
-2. ALWAYS organize files in appropriate subdirectories
-
-## Git interactions
-
-**Important**: NEVER ever mention a co-authored-by or similar aspects. In particular, never mention the tool used to create the commit message or PR.
-
-Commit early, commit often.
-
-### Git commits
-- **Commit Style**: Use the Conventional Commits specification.
-- **Length Rule**: Strictly enforce a 50-character limit for the subject line.
-- **Formatting**: Keep messages succinct. Never include a body summary or bullet points unless explicitly requested.
-- **Grammar**: Use the imperative mood (e.g., "fix", "add", "refactor" instead of "fixed", "adds").
-
-For commits related to a Github issue, add: `git commit --trailer "Github-Issue:#<number>"` where <number> is the Github Issue number.
-
-When adding tags, if not given an explicit tag name or version, use `git tag --sort=-v:refname` with the Read tool (NOT piped through head) to determine most recent version. NEVER refer to packages/shared/src/version.ts or packages/mobile/app.json for version lookups.
-
-## Code Style
-- Python: Follow PEP 8, use type hints (mypy strict mode)
-- Formatting: Ruff (line length 88)
-- Commenting: Write few or no comments; code should be self-explanatory; dual-audience commenting at maximum density
-- FastAPI: Async patterns for all I/O, Mangum for Lambda integration
-- Terraform: snake_case naming, tag all resources (environment, project, managed_by)
-- Never use `@ts-ignore` or hardcode credentials
 
 <!-- code-review-graph MCP tools -->
 ## MCP Tools: code-review-graph
@@ -118,12 +66,3 @@ Fall back to Grep/Glob/Read **only** when the graph doesn't cover what you need.
 2. Use `detect_changes` for code review.
 3. Use `get_affected_flows` to understand impact.
 4. Use `query_graph` pattern="tests_for" to check coverage.
-
-## Architecture decisions (ADRs)
-
-Settled, non-obvious infra/architecture choices are recorded as MADR ADRs in
-`docs/decisions/` (see `docs/decisions/README.md`). The cross-repo master index lives
-in rlm-trainer `docs/decisions/README.md`. Append an ADR when you make or reverse a
-non-obvious choice; reference its id from the commit. Accepted ADRs are immutable -
-supersede with a new ADR rather than editing one. Cross-repo refs are written
-`<repo> ADR-NNNN` (e.g. local-ai ADR-0007).
