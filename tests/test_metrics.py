@@ -262,6 +262,107 @@ class TestCallScope:
         assert _read(metrics.calls_in_flight, kind="root") == before
 
 
+class TestPerScopeAttribution:
+    """Each subcall attributes to ITS OWN root scope, at any concurrency.
+
+    Subcalls fire on_subcall_start from ThreadPoolExecutor worker threads
+    (local_repl batched queries, srlm candidates) and from broker/handler
+    threads (isolated envs). The wrapper installed by CallScope.__enter__
+    travels into children by reference, so firing the callback read from the
+    rlm AFTER scope entry - from a foreign thread - is exactly the production
+    path.
+    """
+
+    class _FakeRLM:
+        backend_kwargs = {"model_name": "kb-model"}
+        on_subcall_start = None
+        on_subcall_complete = None
+        on_iteration_start = None
+        on_iteration_complete = None
+        logger = None
+
+    def test_concurrent_scopes_attribute_only_their_own_subcalls(self):
+        from concurrent.futures import ThreadPoolExecutor, wait
+
+        rlm_a, rlm_b = self._FakeRLM(), self._FakeRLM()
+        metrics.bind(rlm_a)
+        metrics.bind(rlm_b)
+        children_before = metrics.concurrent_children._value.get()
+
+        with metrics.CallScope(rlm_a) as scope_a, metrics.CallScope(rlm_b) as scope_b:
+            # a: 5 subcalls, max depth 3; b: 2 subcalls, max depth 1.
+            plan = [(rlm_a, d) for d in (1, 1, 2, 3, 1)] + [(rlm_b, d) for d in (1, 1)]
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                futures = [
+                    pool.submit(rlm.on_subcall_start, depth, "kb-model", "p")
+                    for rlm, depth in plan
+                ]
+                wait(futures)
+            assert scope_a._fanout == 5
+            assert scope_a._max_depth_seen == 3
+            assert scope_b._fanout == 2
+            assert scope_b._max_depth_seen == 1
+            # Global gauge stays global: all 7 subcalls counted once each.
+            assert metrics.concurrent_children._value.get() == children_before + 7
+
+        for rlm, depth in plan:
+            metrics._tracker.on_subcall_complete(depth, "kb-model", 0.01, None)
+
+    def test_bystander_scope_sees_no_foreign_subcalls(self):
+        rlm_active, rlm_idle = self._FakeRLM(), self._FakeRLM()
+        metrics.bind(rlm_active)
+        metrics.bind(rlm_idle)
+        with metrics.CallScope(rlm_active) as active, metrics.CallScope(rlm_idle) as idle:
+            rlm_active.on_subcall_start(1, "kb-model", "p")
+            assert active._fanout == 1
+            assert idle._fanout == 0
+            assert idle._max_depth_seen == 0
+        metrics._tracker.on_subcall_complete(1, "kb-model", 0.01, None)
+
+    def test_child_rlm_inherits_scope_wrapper_through_subcall(self):
+        """The real spawn path: RLM._subcall constructs the child with
+        on_subcall_start=self.on_subcall_start, so the scope wrapper follows
+        the recursion regardless of which thread runs the subcall."""
+        from concurrent.futures import ThreadPoolExecutor
+        from unittest.mock import patch
+
+        import prehend.core.rlm as rlm_module
+        from prehend import RLM
+        from tests.test_subcall import create_mock_lm, final
+
+        captured: dict = {}
+        original_rlm = rlm_module.RLM
+
+        class CapturingRLM(original_rlm):
+            def __init__(self, *args, **kwargs):
+                captured.update(kwargs)
+                super().__init__(*args, **kwargs)
+
+        with patch.object(rlm_module, "get_client") as mock_get_client:
+            mock_get_client.return_value = create_mock_lm([final("child answer")])
+            parent = RLM(
+                backend="openai",
+                backend_kwargs={"model_name": "kb-model"},
+                max_depth=3,
+            )
+            metrics.bind(parent)
+            with metrics.CallScope(parent) as scope:
+                with patch.object(rlm_module, "RLM", CapturingRLM):
+                    with ThreadPoolExecutor(max_workers=1) as pool:
+                        pool.submit(parent._subcall, "test prompt").result()
+                assert captured["on_subcall_start"] is parent.on_subcall_start
+                assert scope._fanout == 1
+                assert scope._max_depth_seen == 1
+
+    def test_scope_restores_previous_callback_on_exit(self):
+        rlm = self._FakeRLM()
+        metrics.bind(rlm)
+        bound = rlm.on_subcall_start
+        with metrics.CallScope(rlm):
+            assert rlm.on_subcall_start is not bound
+        assert rlm.on_subcall_start is bound
+
+
 class TestPrometheusMemoryObserver:
     """MemoryHarness telemetry -> localai_prehend_memory_* series."""
 

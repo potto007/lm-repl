@@ -35,5 +35,6 @@ lives in [rlm-trainer `docs/decisions/README.md`](https://github.com/ClearBridge
 | [0020](0020-entry-id-includes-provenance.md) | Experience id keys on (question, provenance) so failure guards and success recipes coexist (amends 0011) | accepted |
 | [0021](0021-vllm-as-served-inference.md) | vLLM 0.23.0 as the served inference for v13 (TRITON_ATTN, fp8_e4m3 KV, max-model-len 65536); supersedes 0016 | accepted |
 | [0022](0022-cold-baseline-via-frozen-retrieval-and-persistent-bank.md) | Cold baseline = frozen retrieval (not an empty bank); the memory bank is persistent and versioned | accepted |
+| [0023](0023-per-scope-subcall-attribution.md) | Per-root subcall attribution via a scope-bound callback, not broadcast | accepted |
 
 `0000-template.md` is the MADR template for new records.

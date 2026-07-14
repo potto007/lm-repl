@@ -311,25 +311,16 @@ class PrometheusLogger:
 class _ConcurrencyTracker:
     """Per-process running totals of child RLMs in flight.
 
-    Also fans subcall_start events out to every currently-open CallScope so
-    per-root max-depth and fanout get observed at scope exit. With concurrent
-    asks the attribution overcounts (each scope sees every subcall on the
-    process); kb-librarian's max_concurrent_asks of 2 keeps the bias small.
+    Process-global gauges only. Per-root attribution (root_fanout,
+    root_max_depth) lives in CallScope, which hooks its root RLM's
+    on_subcall_start so every subcall lands on its own scope at any
+    concurrency (see CallScope.__enter__).
     """
-
-    def __init__(self) -> None:
-        self._lock = threading.Lock()
 
     def on_subcall_start(self, depth: int, model: str, prompt_preview: str) -> None:
         concurrent_children.inc()
         calls_in_flight.labels(kind="child").inc()
         subcall_depth.observe(depth)
-        # Propagate to every open root-call scope (process-local).
-        with CallScope._active_lock:
-            for scope in CallScope._active:
-                if depth > scope._max_depth_seen:
-                    scope._max_depth_seen = depth
-                scope._fanout += 1
 
     def on_subcall_complete(
         self, depth: int, model: str, duration: float, error_msg: str | None
@@ -372,7 +363,9 @@ _tracker = _ConcurrencyTracker()
 def bind(rlm, *, model_label: str | None = None) -> None:
     """Attach Prometheus callbacks to an RLM/SRLM instance.
 
-    Idempotent in the sense that re-binding overwrites prior callbacks. The
+    Idempotent in the sense that re-binding overwrites prior callbacks - so
+    bind BEFORE entering a CallScope, or the scope's attribution wrapper is
+    clobbered. The
     binding installs a PrometheusLogger if `rlm.logger` is None; if the caller
     has already configured a logger, it is left alone (root iteration metrics
     are still produced via the on_iteration_complete callback).
@@ -397,14 +390,19 @@ class CallScope(AbstractContextManager):
     """Wrap a root RLM call to capture per-call metrics.
 
     Tracks calls_in_flight at the root kind, call_duration_seconds, context
-    size, root_max_depth and root_fanout. Per-root max-depth/fanout come from
-    on_subcall_start fan-out into the active-scope set (see _ConcurrencyTracker).
-    The model label is read from `rlm.backend_kwargs["model_name"]` if not
-    explicitly provided.
+    size, root_max_depth and root_fanout. Per-root max-depth/fanout are exact
+    at any concurrency: __enter__ replaces the root RLM's on_subcall_start
+    with a scope-bound wrapper (chaining to the bind()-installed global
+    tracker), and every descendant RLM inherits that wrapper BY REFERENCE at
+    construction (rlm.py _subcall, srlm.py _spawn_candidate_rlm). Attribution
+    therefore rides the object graph, not thread context - it survives the
+    LocalREPL/SRLM thread pools and the isolated-env broker/handler threads,
+    which a contextvars approach cannot reach (those threads outlive and
+    predate any scope). Enter the scope AFTER bind(), one scope per RLM
+    instance at a time (an RLM cannot run two root completions concurrently
+    anyway). The model label is read from `rlm.backend_kwargs["model_name"]`
+    if not explicitly provided.
     """
-
-    _active: set[CallScope] = set()
-    _active_lock = threading.Lock()
 
     def __init__(self, rlm, *, prompt: str | None = None, model_label: str | None = None) -> None:
         self._rlm = rlm
@@ -418,6 +416,8 @@ class CallScope(AbstractContextManager):
         self._error_class = "none"
         self._max_depth_seen = 0
         self._fanout = 0
+        self._attr_lock = threading.Lock()
+        self._prev_on_subcall_start = None
 
     def __enter__(self) -> CallScope:
         calls_in_flight.labels(kind="root").inc()
@@ -426,8 +426,21 @@ class CallScope(AbstractContextManager):
                 context_chars.observe(len(self._prompt))
             except Exception:
                 callback_failures_total.inc()
-        with CallScope._active_lock:
-            CallScope._active.add(self)
+        prev = getattr(self._rlm, "on_subcall_start", None)
+        self._prev_on_subcall_start = prev
+
+        def _on_subcall_start(depth: int, model: str, prompt_preview: str) -> None:
+            try:
+                with self._attr_lock:
+                    if depth > self._max_depth_seen:
+                        self._max_depth_seen = depth
+                    self._fanout += 1
+            except Exception:
+                callback_failures_total.inc()
+            if prev is not None:
+                prev(depth, model, prompt_preview)
+
+        self._rlm.on_subcall_start = _on_subcall_start
         self._start = time.perf_counter()
         return self
 
@@ -445,8 +458,7 @@ class CallScope(AbstractContextManager):
                 "timeout" if exc_type and "Timeout" in exc_type.__name__ else "error"
             )
             self._error_class = (exc_type.__name__ if exc_type else "Exception")[:48]
-        with CallScope._active_lock:
-            CallScope._active.discard(self)
+        self._rlm.on_subcall_start = self._prev_on_subcall_start
         calls_in_flight.labels(kind="root").dec()
         srlm_candidates_in_flight.set(0)
         calls_total.labels(kind="root", model=self._model, outcome=self._outcome).inc()
