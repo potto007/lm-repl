@@ -395,6 +395,11 @@ class Harness:
     def completion(self, context: str, query: str) -> "RLMChatCompletion":
         return self.inference_client.completion(context, query)
 
+    @property
+    def last_injection(self) -> dict | None:
+        """Injection record of the most recent solve (None when memory is off)."""
+        return getattr(self.inference_client, "last_injection", None)
+
     def record_outcome(self, correct: bool | None = True) -> None:
         """Distill the last solve when memory uses deferred collection.
 

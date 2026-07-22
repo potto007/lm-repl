@@ -136,6 +136,9 @@ class MemoryHarness:
         # caps negative entries per injected block so they cannot crowd out
         # positive recipes (the structural anti-poisoning backstop).
         self.learn_from_failure = learn_from_failure
+        # Per-solve injection record for eval drivers: {"retrieved": int,
+        # "injected": [{"id", "polarity", "score"}]}. Overwritten each answer().
+        self.last_injection: dict | None = None
         self.max_inject_negatives = max_inject_negatives
         # When True, answer() solves but does NOT distill; the caller invokes
         # collect_pending(correct) once it knows the outcome, so a wrong solve
@@ -181,6 +184,15 @@ class MemoryHarness:
         # a negative repeatedly retrieved-but-capped-out stays use_count==0 and is
         # eligible for prune() (the bank self-cleans dominated negatives).
         injected = select_for_injection(entries, max_negatives=self.max_inject_negatives)
+        score_by_id = {id(e): s for e, s in zip(entries, scores)}
+        self.last_injection = {
+            "retrieved": len(entries),
+            "injected": [
+                {"id": e.get("id"), "polarity": e.get("polarity"),
+                 "score": round(score_by_id.get(id(e), 0.0), 4)}
+                for e in injected
+            ],
+        }
 
         block = ""
         if injected:

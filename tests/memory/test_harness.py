@@ -62,6 +62,23 @@ def test_with_memory_injects_block_into_root_prompt(tmp_path):
     assert root_prompt.rstrip().endswith("Q")
 
 
+def test_last_injection_records_injected_entries(tmp_path):
+    bank = Bank(tmp_path / "mem")
+    bank.append(_entry("a", [1.0, 0.0]))
+    harness = MemoryHarness(FakeInferenceClient(), bank, FakeBackend({"Q": [1.0, 0.0]}), min_cosine=0.5)
+    assert harness.last_injection is None
+    harness.answer(context="ctx", question="Q")
+    rec = harness.last_injection
+    assert rec["retrieved"] == 1
+    assert rec["injected"] == [{"id": "a", "polarity": "positive", "score": 1.0}]
+
+
+def test_last_injection_empty_on_miss(tmp_path):
+    harness = MemoryHarness(FakeInferenceClient(), Bank(tmp_path / "mem"), FakeBackend())
+    harness.answer(context="ctx", question="Q")
+    assert harness.last_injection == {"retrieved": 0, "injected": []}
+
+
 def test_returns_inference_client_result(tmp_path):
     bank = Bank(tmp_path / "mem")
     inference_client = FakeInferenceClient(answer="hello")
